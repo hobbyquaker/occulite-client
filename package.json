@@ -1,0 +1,53 @@
+{
+  "name": "occulite-client",
+  "version": "0.1.0",
+  "description": "One client for openccu-lite's APIs: lite-rpc requests and events, the state store, the metadata, pairing - for hm2mqtt.js, node-red-contrib-ccu, Homematic Manager and anyone else",
+  "type": "module",
+  "license": "MIT",
+  "author": "Sebastian Raff",
+  "keywords": [
+    "homematic",
+    "ccu",
+    "openccu",
+    "openccu-lite",
+    "occulited",
+    "lite-rpc",
+    "hmip"
+  ],
+  "engines": {
+    "node": "^20.19 || ^22.12 || >=24"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node/index.d.ts",
+      "default": "./dist/node/index.js"
+    },
+    "./callbacks": {
+      "types": "./dist/callbacks.d.ts",
+      "default": "./dist/callbacks.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/fakebox.d.ts",
+      "default": "./dist/testing/fakebox.js"
+    }
+  },
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --experimental-strip-types test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "typescript": "5.9"
+  }
+}
