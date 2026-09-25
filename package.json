@@ -5,6 +5,14 @@
   "type": "module",
   "license": "MIT",
   "author": "Sebastian Raff",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hobbyquaker/occulite-client.git"
+  },
+  "homepage": "https://github.com/hobbyquaker/occulite-client#readme",
+  "bugs": {
+    "url": "https://github.com/hobbyquaker/occulite-client/issues"
+  },
   "keywords": [
     "homematic",
     "ccu",
@@ -39,12 +47,14 @@
     "dist",
     "docs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test --experimental-strip-types test/*.test.ts"
+    "test": "node --test --experimental-strip-types test/*.test.ts",
+    "prepack": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^24.13.6",
