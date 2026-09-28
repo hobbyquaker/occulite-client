@@ -131,6 +131,60 @@ test('the callbacks module: the old callback-server arguments', async (t) => {
     c.close();
 });
 
+test('the callbacks module: initId as a function, the synthetic interface method, the device calls with the CCU\'s argument lists', async (t) => {
+    const b = new FakeBox({interfaces: ['HmIP-RF', 'BidCos-RF'], devices: {'HmIP-RF': [{ADDRESS: 'H', TYPE: 'HmIP-PDT'}], 'BidCos-RF': []}});
+    await b.start();
+    t.after(() => b.stop());
+    const c = new OccuLite({url: b.url, values: false, meta: false});
+    t.after(() => c.close());
+    const asked: string[] = [];
+    const srv = callbackEvents(c, {initId: (i) => (asked.push(i), `nr_ab12cd_${i}`), interfaceEvents: true});
+    const got: [string, unknown[]][] = [];
+    for (const m of ['event', 'system.multicall', 'newDevices', 'deleteDevices', 'updateDevice', 'replaceDevice', 'readdedDevice', 'interface', 'listDevices']) {
+        srv.on(m, (err, p, cb) => {
+            assert.equal(err, null);
+            assert.ok(Array.isArray(p) && typeof p[Symbol.iterator] === 'function', 'params iterable (node-red-contrib-ccu\'s guard)');
+            assert.equal(typeof cb, 'function');
+            got.push([m, p]);
+        });
+    }
+    await c.ready();
+    const n = got.length; // the ?devices=1 snapshot: newDevices per interface
+    assert.ok(got.slice(0, n).every(([m]) => m === 'newDevices'));
+    assert.deepEqual(got.find(([, p]) => p[0] === 'nr_ab12cd_HmIP-RF')?.[1], ['nr_ab12cd_HmIP-RF', [{ADDRESS: 'H', TYPE: 'HmIP-PDT'}]]);
+    b.event('BidCos-RF', 'JEQ0000001:1', 'STATE', true);
+    b.push('deleteDevices', {interface: 'BidCos-RF', addresses: ['JEQ0000001', 'JEQ0000001:1']});
+    b.push('updateDevice', {interface: 'BidCos-RF', addresses: ['JEQ0000002']});
+    b.push('replaceDevice', {interface: 'BidCos-RF', addresses: ['JEQ0000003', 'JEQ0000004']});
+    b.push('readdedDevice', {interface: 'BidCos-RF', addresses: ['JEQ0000005', 'JEQ0000005:1']});
+    b.push('interface', {interface: 'BidCos-RF', state: 'down'});
+    b.push('interface', {interface: 'BidCos-RF', state: 'up'});
+    await until(() => got.length === n + 7);
+    assert.deepEqual(got.slice(n), [
+        ['event', ['nr_ab12cd_BidCos-RF', 'JEQ0000001:1', 'STATE', true]],
+        ['deleteDevices', ['nr_ab12cd_BidCos-RF', ['JEQ0000001', 'JEQ0000001:1']]],
+        ['updateDevice', ['nr_ab12cd_BidCos-RF', 'JEQ0000002', 0]],
+        ['replaceDevice', ['nr_ab12cd_BidCos-RF', 'JEQ0000003', 'JEQ0000004']],
+        ['readdedDevice', ['nr_ab12cd_BidCos-RF', ['JEQ0000005', 'JEQ0000005:1']]],
+        ['interface', ['nr_ab12cd_BidCos-RF', 'BidCos-RF', 'down']],
+        ['interface', ['nr_ab12cd_BidCos-RF', 'BidCos-RF', 'up']],
+    ]);
+    assert.ok(asked.includes('HmIP-RF') && asked.includes('BidCos-RF'), 'the id function saw every interface');
+    assert.ok(!got.some(([m]) => m === 'listDevices'));
+    srv.close();
+    // without interfaceEvents, no synthetic method; initIds beats initId
+    const plain = callbackEvents(c, {initIds: {'BidCos-RF': 'fixed'}, initId: 'x'});
+    const seen: unknown[][] = [];
+    plain.on('interface', (_e, p) => seen.push(p));
+    plain.on('event', (_e, p) => seen.push(p));
+    b.push('interface', {interface: 'BidCos-RF', state: 'up'});
+    b.event('BidCos-RF', 'JEQ0000001:1', 'STATE', false);
+    b.event('HmIP-RF', 'H:1', 'STATE', false);
+    await until(() => seen.length === 2);
+    assert.deepEqual(seen, [['fixed', 'JEQ0000001:1', 'STATE', false], ['x', 'H:1', 'STATE', false]]);
+    plain.close();
+});
+
 test('pairing: the code both sides show, the token after the approval', async () => {
     let code = '';
     const p = pair({url: box.url, app: 'test-app', appVersion: '1.0.0', instance: 'ci', access: {devices: 'read'}, onCode: (c) => (code = c)});

@@ -3,6 +3,18 @@
 // `newDevices`, `deleteDevices`, `updateDevice`, `replaceDevice`, `readdedDevice` - with the same
 // argument lists and a no-op callback, so a consumer's rpcMethods/METHODS table feeds from the
 // stream unchanged. It supersedes homematic-xmlrpc task 1's createEventStream.
+//
+// The argument lists, as the CCU's interface processes send them (params is always an array):
+//   event            [initId, address, key, value]
+//   system.multicall [[{methodName: 'event', params: [initId, address, key, value]}, ...]]
+//   newDevices       [initId, descriptions]           the descriptions, as listDevices gives them
+//   deleteDevices    [initId, addresses]
+//   updateDevice     [initId, address, hint]           hint is 0: the stream carries none (yet)
+//   replaceDevice    [initId, oldAddress, newAddress]
+//   readdedDevice    [initId, addresses]
+//   interface        [initId, interface, state]        synthetic, only with interfaceEvents: true
+// Never emitted: listDevices (the system does not ask a client for its device list), init,
+// setReadyConfig, system.listMethods - a consumer's handlers for them stay for its CCU path.
 
 import type {OccuLite, ValueEvent} from './client.ts';
 import {parseRef} from './refs.ts';
@@ -14,15 +26,28 @@ export interface CallbackServer {
     close(): void;
 }
 
+export interface CallbackOptions {
+    /** the id per interface the consumer would have passed to init (its first argument back) */
+    initIds?: Record<string, string>;
+    /** the id for an interface not in initIds: a string for all, or derived per interface - the
+     *  consumers' shapes are `nr_<6 chars>_<iface>`, `mb_<iface>`, `hm2mqtt_hm_<iface>`; default the
+     *  interface name */
+    initId?: string | ((iface: string) => string);
+    /** a batch as one system.multicall (default true); false: every event as a single `event` */
+    batches?: boolean;
+    /** also emit the synthetic `interface` method on interface state changes (default false) */
+    interfaceEvents?: boolean;
+}
+
 const noop = () => {};
 
-/** initIds: the id per interface the consumer would have passed to init (its first argument back). */
-export function callbackEvents(box: OccuLite, opts: {initIds: Record<string, string>; batches?: boolean}): CallbackServer {
+/** The stream's events as the callback server's method calls. */
+export function callbackEvents(box: OccuLite, opts: CallbackOptions = {}): CallbackServer {
     const fns = new Map<string, Callback[]>();
     const call = (method: string, params: unknown[]) => {
         for (const f of fns.get(method) ?? []) f(null, params, noop);
     };
-    const id = (iface: string) => opts.initIds[iface] ?? iface;
+    const id = (iface: string) => opts.initIds?.[iface] ?? (typeof opts.initId === 'function' ? opts.initId(iface) : (opts.initId ?? iface));
     const offs: (() => void)[] = [];
     // a batch as one system.multicall (hmipserver's and rfd's shape), a single event as event
     if (opts.batches !== false) {
@@ -61,6 +86,9 @@ export function callbackEvents(box: OccuLite, opts: {initIds: Record<string, str
             }
         }),
     );
+    if (opts.interfaceEvents) {
+        offs.push(box.on('interface', (ev: {interface: string; state: string}) => call('interface', [id(ev.interface), ev.interface, ev.state])));
+    }
     return {
         on(method, fn) {
             let l = fns.get(method);

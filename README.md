@@ -173,13 +173,25 @@ talks to the API on its own (not through this client) and replays the cookie for
 ```js
 import {callbackEvents} from 'occulite-client/callbacks'
 
-const server = callbackEvents(box, {initIds: {'HmIP-RF': 'myapp_HmIP-RF'}})
+const server = callbackEvents(box, {initId: iface => `myapp_${iface}`, interfaceEvents: true})
 server.on('event', (err, [initId, address, key, value], cb) => {})
-server.on('system.multicall', (err, [calls], cb) => {})
+server.on('system.multicall', (err, [calls], cb) => {})           // calls: [{methodName: 'event', params: [...]}]
 server.on('newDevices', (err, [initId, descriptions], cb) => {})
+server.on('deleteDevices', (err, [initId, addresses], cb) => {})
+server.on('updateDevice', (err, [initId, address, hint], cb) => {})   // hint is 0: the stream carries none
+server.on('replaceDevice', (err, [initId, oldAddress, newAddress], cb) => {})
+server.on('readdedDevice', (err, [initId, addresses], cb) => {})
+server.on('interface', (err, [initId, iface, state], cb) => {})   // synthetic, with interfaceEvents: true
 ```
 
-The same method events and argument lists as homematic-xmlrpc's and binrpc's servers.
+The same method events and argument lists as homematic-xmlrpc's and binrpc's servers (`params` is always an
+array), so a table of handlers written for `createServer` feeds from the stream unchanged. `initId` is a string, or
+a function of the interface name (the ids programs derive - `nr_<6 chars>_<iface>`, `mb_<iface>` - work as they
+are); `initIds: {iface: id}` pins single ones. `interface` is a method no callback server ever had: off by default,
+it tells a program that drove its per-interface status from `init`'s success where the interface stands (`up`,
+`down`, `restarted`, `added`, `removed`). **Never emitted:** `listDevices` (the system does not ask a client for its
+device list), `init`, `setReadyConfig`, `system.listMethods` - your handlers for them stay for the CCU path.
+`newDevices` carries the descriptions, as on a CCU (the client fetches them when the stream names addresses only).
 
 ## Testing
 

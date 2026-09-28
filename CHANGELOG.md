@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `callbacks`: `initId` as a string or a function of the interface (beside `initIds`), the synthetic `interface`
+  method with `interfaceEvents: true` (`[initId, iface, state]`), the argument lists documented; `updateDevice`'s
+  hint stays `0` (the stream carries none); `listDevices` is never emitted.
+
 - The description cache: `paramsetDescription()` is keyed by device type, firmware, version, channel type and
   paramset (`iface/TYPE/FIRMWARE/VERSION/chType/paramset`, the consumers' `paramsets.json` key; `descriptionKey()`
   exported, `box.descriptionKey(ref)`), so one `getParamsetDescription` serves every channel of a type; a channel not
