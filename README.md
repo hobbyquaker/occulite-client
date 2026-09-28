@@ -99,6 +99,21 @@ from its cache); rfd asks a BidCos actuator for its status on every `getParamset
 channel once and never as a poll, and leaves out a BidCos device whose `UNREACH` is set. The stream keeps everything
 current afterwards.
 
+**The description cache.** `paramsetDescription(ref, paramset)` is answered from a cache keyed by the device's
+`TYPE`, `FIRMWARE` and `VERSION`, the channel's `TYPE` and the paramset - `iface/TYPE/FIRMWARE/VERSION/chType/paramset`,
+the key node-red-contrib-ccu's, hm2mqtt.js's and matterbridge-homematic's `paramsets.json` files use - so a
+200-channel system asks `getParamsetDescription` once per channel type, not 200 times, and the typed double needs
+no request before a write. `memoryCache()` is the default; `fileCache(path, {seed})` from `occulite-client/node`
+keeps it across restarts in one JSON file (debounced writes, a temporary file and a rename) and takes an existing
+`paramsets.json` as `seed`. The metadata snapshot goes into the same cache under `meta/snapshot`, so names are there
+before the system answers (and stay when it does not). `box.descriptionKey(ref, paramset)` gives the key.
+
+```js
+import {createClient, fileCache} from 'occulite-client/node'
+const cache = fileCache('/var/lib/myapp/occulite-cache.json', {seed: 'paramsets.json'})
+const box = createClient({url, auth: {token}, trust: {fingerprint256}, cache})
+```
+
 **Timeouts.** Every request has one - `timeout` (default 30 s; `box.request(…, {timeout, signal})` per call) - and
 rejects `timeout`, never `unreachable`, when the system does not answer in time. `connectTimeout` (default 60 s)
 bounds the whole `ready()`; `readyTimeout` (default 30 s) is how long it waits for the device lists before it

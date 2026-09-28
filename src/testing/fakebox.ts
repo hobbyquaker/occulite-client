@@ -26,6 +26,8 @@ export interface FakeBoxOptions {
     interfaces?: (string | {name: string; running?: boolean})[];
     /** false: an older system without GET /api/rpc/v1/interfaces (404) */
     interfacesRoute?: boolean;
+    /** false: the metadata snapshot answers 503 (a system whose metadata is not up yet) */
+    metaRoute?: boolean;
     /** device descriptions per interface (listDevices) */
     devices?: Record<string, Record<string, unknown>[]>;
     /** VALUES paramset descriptions by `<interface>.<channel>` */
@@ -352,6 +354,7 @@ export class FakeBox {
             };
             return this.json(res, 200, Array.isArray(b) ? b.map(one) : one(b));
         }
+        if (key === 'GET /api/meta/v1/snapshot' && this.opts.metaRoute === false) return this.json(res, 503, {error: 'unavailable', message: 'not yet'});
         if (key === 'GET /api/meta/v1/snapshot') return this.json(res, 200, {format: 1, ...(this.opts.meta ?? {revision: 0, objects: {}, enums: {}})});
         if (key === 'GET /api/meta/v1/events/sse') {
             this.metaStreamsOpened++;

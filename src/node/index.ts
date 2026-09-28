@@ -3,12 +3,14 @@
 // client half of task 219), which binds its code to the certificate it saw.
 
 import {createHash, randomBytes} from 'node:crypto';
-import {readFile} from 'node:fs/promises';
+import {mkdir, readFile, rename, writeFile} from 'node:fs/promises';
+import {dirname} from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 import * as net from 'node:net';
 import * as tls from 'node:tls';
 import type {TLSSocket} from 'node:tls';
+import type {DescriptionCache} from '../cache.ts';
 import {OccuLite, REQUEST_HEADER, type Auth, type AuthProvider, type Credential, type Options} from '../client.ts';
 import {OccuLiteError, abortError, httpError, timeoutSignal, transportReason, type CertificateInfo} from '../errors.ts';
 import type {Transport, TransportResponse} from '../transport.ts';
@@ -200,6 +202,78 @@ export async function probeUntil(address: string, opts: ProbeOptions & {schedule
             opts.signal?.addEventListener('abort', done, {once: true});
         });
     }
+}
+
+// ---- the file cache ------------------------------------------------------------------------------
+
+export interface FileCache extends DescriptionCache {
+    /** writes what changed now (the writes are debounced otherwise) */
+    flush(): Promise<void>;
+    /** flushes and stops the timer */
+    close(): Promise<void>;
+    /** what is loaded, once ready() resolved */
+    ready(): Promise<void>;
+    readonly size: number;
+}
+
+/** A DescriptionCache in one JSON file - `{"<key>": <description>, "meta/snapshot": {...}}`, the
+ *  consumers' paramsets.json shape - read at start, written debounced (default 1 s) through a
+ *  temporary file and a rename. `seed` is a file whose entries fill what the cache file lacks (a
+ *  node-red-contrib-ccu paramsets.json, say); it is never written. */
+export function fileCache(path: string, o: {seed?: string; debounceMs?: number} = {}): FileCache {
+    const m = new Map<string, unknown>(); // the file's entries: what this cache learned
+    const seed = new Map<string, unknown>(); // the seed's: read, never written
+    let dirty = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let writing: Promise<void> = Promise.resolve();
+    const readInto = async (file: string, into: Map<string, unknown>) => {
+        try {
+            const j = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
+            if (j && typeof j === 'object') for (const [k, v] of Object.entries(j)) into.set(k, v);
+        } catch {
+            /* no file yet, or not JSON: an empty cache */
+        }
+    };
+    const loaded = (async () => {
+        await readInto(path, m);
+        if (o.seed) await readInto(o.seed, seed);
+    })();
+    const write = async () => {
+        if (!dirty) return;
+        dirty = false;
+        const body = JSON.stringify(Object.fromEntries(m));
+        await mkdir(dirname(path), {recursive: true}).catch(() => {});
+        const tmp = `${path}.${process.pid}.tmp`;
+        await writeFile(tmp, body, 'utf8');
+        await rename(tmp, path);
+    };
+    const flush = () => {
+        clearTimeout(timer);
+        timer = undefined;
+        writing = writing.then(write, write);
+        return writing;
+    };
+    return {
+        ready: () => loaded,
+        async get(k) {
+            await loaded;
+            return m.has(k) ? m.get(k) : seed.get(k);
+        },
+        async set(k, v) {
+            await loaded;
+            m.set(k, v);
+            dirty = true;
+            timer ??= setTimeout(() => void flush(), o.debounceMs ?? 1000);
+            timer.unref?.();
+        },
+        flush,
+        async close() {
+            await flush();
+        },
+        get size() {
+            return m.size + [...seed.keys()].filter((k) => !m.has(k)).length;
+        },
+    };
 }
 
 // ---- credentials on the system -----------------------------------------------------------------

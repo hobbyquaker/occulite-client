@@ -5,6 +5,7 @@
 // last event id, re-read after a resync, the batches of one multicall together. Requests go over
 // lite-rpc's JSON-RPC path, a FLOAT datapoint written as a typed double.
 
+import {META_SNAPSHOT_KEY, descriptionKey, memoryCache, type DescriptionCache} from './cache.ts';
 import {OccuLiteError, abortError, httpError, timeoutSignal} from './errors.ts';
 import {MetaCopy, type MetaDocument, type MetaEvent} from './meta.ts';
 import {datapointRef, deviceOf, parseDatapointRef, parseRef, ref as mkRef} from './refs.ts';
@@ -52,6 +53,9 @@ export interface Options {
     values?: boolean | 'all';
     /** the sweep's pace, ms between two getParamset calls; default 200 (rfd serialises them at about five a second) */
     sweepPaceMs?: number;
+    /** paramset descriptions by device type, firmware, version and channel type, and the metadata
+     *  snapshot: memoryCache() by default; fileCache() from occulite-client/node keeps them across restarts */
+    cache?: DescriptionCache;
     /** keep a live copy of names and taxonomy (default true) */
     meta?: boolean;
     /** the device descriptions at connect and their changes (default true) */
@@ -172,6 +176,7 @@ export class OccuLite {
     inflight = 0;
 
     private tx: Transport;
+    private cache: DescriptionCache;
     private auth: Auth = {};
     private reauthAt = 0;
     private handlers = new Map<string, Set<Handler>>();
@@ -197,6 +202,7 @@ export class OccuLite {
         this.opts = opts;
         this.url = opts.url.replace(/\/+$/, '');
         this.tx = opts.transport ?? fetchTransport();
+        this.cache = opts.cache ?? memoryCache();
         if (opts.auth && !isProvider(opts.auth)) this.takeAuth(opts.auth);
     }
 
@@ -307,6 +313,11 @@ export class OccuLite {
 
     private async connectSteps(signal?: AbortSignal): Promise<void> {
         this.setStatus('connecting');
+        // the names from the last run, before the system answers (replaced by the live snapshot)
+        if (this.opts.meta !== false && this.meta.revision === 0) {
+            const cached = (await Promise.resolve(this.cache.get(META_SNAPSHOT_KEY)).catch(() => undefined)) as MetaDocument | undefined;
+            if (cached && typeof cached === 'object' && cached.objects) this.meta.load(cached);
+        }
         await this.resolveAuth('start');
         const v = await this.request<Info & {capabilities?: Capabilities}>('GET', '/api/meta/v1/version', undefined, {signal}).catch((e: OccuLiteError) => {
             if (e.code === 'not-found' || e.status === 404) throw new OccuLiteError('unsupported', 'not an openccu-lite system (no /api/meta/v1/version)');
@@ -456,7 +467,10 @@ export class OccuLite {
 
     private async loadMeta(signal?: AbortSignal): Promise<void> {
         const doc = await this.request<MetaDocument>('GET', '/api/meta/v1/snapshot', undefined, {signal}).catch(() => undefined);
-        if (doc) this.meta.load(doc);
+        if (doc) {
+            this.meta.load(doc);
+            await Promise.resolve(this.cache.set(META_SNAPSHOT_KEY, doc)).catch((e) => this.opts.log?.warn?.(`occulite-client: the cache did not take the snapshot: ${(e as Error).message}`));
+        }
     }
 
     /** Opens a stream with a silence watchdog: no message or ping for streamTimeout ends it, and
@@ -511,7 +525,7 @@ export class OccuLite {
                 if (this.abort.signal.aborted) break;
                 const {interface: i, address} = parseRef(ref);
                 const desc = this.devices.get(ref);
-                if (this.skipSweep(i, address, desc)) {
+                if (await this.skipSweep(i, address, desc)) {
                     res.skipped++;
                     continue;
                 }
@@ -554,7 +568,7 @@ export class OccuLite {
         return all.filter((r) => want.has(r) || want.has(r.slice(0, r.lastIndexOf(':'))));
     }
 
-    private skipSweep(iface: string, address: string, desc: Record<string, unknown> | undefined): boolean {
+    private async skipSweep(iface: string, address: string, desc: Record<string, unknown> | undefined): Promise<boolean> {
         const paramsets = desc?.PARAMSETS;
         if (Array.isArray(paramsets) && !paramsets.includes('VALUES')) return true;
         // a BidCos device that does not answer costs rfd's retries on the air for nothing; hmipserver answers from its cache
@@ -563,7 +577,7 @@ export class OccuLite {
             if (this.values.get(datapointRef(iface, `${dev}:0`, 'UNREACH'))?.value === true) return true;
         }
         // a channel whose VALUES description is at hand and names only keys the store keeps has nothing to add
-        const known = this.cachedDescription(mkRef(iface, address));
+        const known = await this.cachedDescription(mkRef(iface, address));
         if (known && this.storeKeys && Object.keys(known).every((k) => this.storeKeys!.has(k) || (k.startsWith('ERROR_') && this.storeKeys!.has('ERROR_*')))) return true;
         return false;
     }
@@ -793,21 +807,42 @@ export class OccuLite {
         });
     }
 
-    private descKnown = new Map<string, Record<string, ParamDesc>>();
-
-    /** A VALUES description already fetched, without a request; undefined otherwise. */
-    private cachedDescription(channelRef: string): Record<string, ParamDesc> | undefined {
-        return this.descKnown.get(`${channelRef}|VALUES`);
+    /** The cache key of a channel's paramset description, from box.devices: the device's TYPE,
+     *  FIRMWARE and VERSION and the channel's TYPE (descriptionKey()); undefined while the channel or
+     *  its device is not known, which makes the call per channel. */
+    descriptionKey(channelRef: string, paramset = 'VALUES'): string | undefined {
+        const {interface: i, address} = parseRef(channelRef);
+        const ch = this.devices.get(channelRef);
+        if (!ch) return undefined;
+        const parent = typeof ch.PARENT === 'string' && ch.PARENT ? this.devices.get(mkRef(i, ch.PARENT)) : undefined;
+        if (ch.PARENT && !parent) return undefined;
+        return parent ? descriptionKey(i, parent, ch, paramset) : descriptionKey(i, ch, undefined, paramset);
     }
 
-    /** A channel's paramset description, cached per channel. */
+    /** A VALUES description the cache has, without a request; undefined otherwise. */
+    private async cachedDescription(channelRef: string): Promise<Record<string, ParamDesc> | undefined> {
+        const k = this.descriptionKey(channelRef);
+        const v = k ? await Promise.resolve(this.cache.get(k)).catch(() => undefined) : undefined;
+        return (v as Record<string, ParamDesc> | undefined) ?? (await this.descCache.get(`${channelRef}|VALUES`)?.catch(() => undefined));
+    }
+
+    /** A channel's paramset description: from the cache by device type, firmware, version and
+     *  channel type (one getParamsetDescription per type, across restarts with a fileCache), else
+     *  fetched and cached; a channel not in box.devices is asked per channel. */
     paramsetDescription(channelRef: string, paramset = 'VALUES'): Promise<Record<string, ParamDesc>> {
         const k = `${channelRef}|${paramset}`;
         let p = this.descCache.get(k);
         if (!p) {
             const {interface: i, address} = parseRef(channelRef);
-            p = this.call<Record<string, ParamDesc>>(i, 'getParamsetDescription', [address, paramset]);
-            p.then((d) => this.descKnown.set(k, d)).catch(() => this.descCache.delete(k));
+            const key = this.descriptionKey(channelRef, paramset);
+            p = (async () => {
+                const hit = key ? ((await Promise.resolve(this.cache.get(key)).catch(() => undefined)) as Record<string, ParamDesc> | undefined) : undefined;
+                if (hit) return hit;
+                const d = await this.call<Record<string, ParamDesc>>(i, 'getParamsetDescription', [address, paramset]);
+                if (key) await Promise.resolve(this.cache.set(key, d)).catch((e) => this.opts.log?.warn?.(`occulite-client: the cache did not take ${key}: ${(e as Error).message}`));
+                return d;
+            })();
+            p.catch(() => this.descCache.delete(k));
             this.descCache.set(k, p);
         }
         return p;

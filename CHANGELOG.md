@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The description cache: `paramsetDescription()` is keyed by device type, firmware, version, channel type and
+  paramset (`iface/TYPE/FIRMWARE/VERSION/chType/paramset`, the consumers' `paramsets.json` key; `descriptionKey()`
+  exported, `box.descriptionKey(ref)`), so one `getParamsetDescription` serves every channel of a type; a channel not
+  in `box.devices` is asked per channel as before. `Options.cache: DescriptionCache` - `memoryCache()` (default) or
+  `occulite-client/node`'s `fileCache(path, {seed, debounceMs})` (one JSON file, debounced atomic writes, a
+  consumer's existing file as the seed). The metadata snapshot is kept under `meta/snapshot` and loaded before the
+  system answers. `FakeBox`: `metaRoute: false`.
+
 - `values: 'all'`: a paced `getParamset(VALUES)` sweep after `ready()` for the datapoints the state store does not
   keep (`sweepPaceMs`, default 200 ms; the `sweep` event with its counts; `box.sweep(refs?)` for a re-run or a device
   paired later). Swept values carry `source: 'sweep'`, `confirmed: true` and no `lc`; the store's entries are never
