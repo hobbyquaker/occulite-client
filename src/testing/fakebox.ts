@@ -166,6 +166,20 @@ export class FakeBox {
         return this.seq + 1;
     }
 
+    /** An interface that appears after the start (hmipserver after rfd): listed, its devices known,
+     *  and `interface {state: 'added'}` on the stream. */
+    addInterface(name: string, o: {running?: boolean; devices?: Record<string, unknown>[]} = {}): void {
+        this.opts.interfaces = [...(this.opts.interfaces ?? ['HmIP-RF']), {name, running: o.running !== false}];
+        if (o.devices) (this.opts.devices ??= {})[name] = o.devices;
+        this.push('interface', {interface: name, state: 'added'});
+    }
+
+    /** An interface goes up or down: the list follows, and `interface {state}` goes out. */
+    setInterface(name: string, running: boolean): void {
+        this.opts.interfaces = this.ifaceList().map((i) => (i.name === name ? {name, running} : i));
+        this.push('interface', {interface: name, state: running ? 'up' : 'down'});
+    }
+
     /** A metadata change event. */
     metaEvent(ev: Record<string, unknown>): void {
         for (const r of this.metaStreams) r.write(`data: ${JSON.stringify(ev)}\n\n`);
@@ -295,7 +309,8 @@ export class FakeBox {
                 else for (const m of this.ring) if (m.seq > n) this.send(res, `${this.bootId}-${m.seq}`, m.event, m.data);
             }
             if (u.searchParams.get('devices') === '1') {
-                for (const i of this.ifaces()) if (!s.interfaces.length || s.interfaces.includes(i)) this.send(res, undefined, 'newDevices', {interface: i, devices: this.opts.devices?.[i] ?? []});
+                // one listDevices per interface; a process that is not running answers with an error, as the system does
+                for (const i of this.ifaceList()) if (!s.interfaces.length || s.interfaces.includes(i.name)) this.send(res, undefined, 'newDevices', i.running ? {interface: i.name, devices: this.opts.devices?.[i.name] ?? []} : {interface: i.name, error: `${i.name} is down`});
             }
             this.streams.add(s);
             req.on('close', () => this.streams.delete(s));
@@ -309,6 +324,8 @@ export class FakeBox {
                 this.calls.push({interface: iface, method: c.method, params: c.params});
                 const [addr, a2] = c.params as [string, string];
                 switch (c.method) {
+                    case 'listDevices':
+                        return {jsonrpc: '2.0', id: c.id, result: this.opts.devices?.[iface] ?? []};
                     case 'getParamsetDescription':
                         return {jsonrpc: '2.0', id: c.id, result: this.opts.descriptions?.[`${iface}.${addr}`] ?? {}};
                     case 'getValue':

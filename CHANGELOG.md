@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `ready()` waits for the device lists of the running interfaces only (a stopped process no longer holds it for
+  `readyTimeout`; the system's `newDevices {error}` snapshot for it is taken as "nothing to wait for"). An interface
+  that appears or comes up after connect is followed: `listDevices` once, the descriptions into `box.devices` and out
+  as one `devices {kind: 'new'}` event; a live `newDevices` with addresses only gets its descriptions the same way.
+  Without an `interfaces` option the stream and the state read carry no interface filter (a filter hides the
+  `interface added` of a later one). `FakeBox`: `addInterface()`, `setInterface()`, `listDevices`, the snapshot's
+  error for a non-running interface.
+
 - Fixed: `MetaCopy` read an enum's nodes from `nodes`/`children`, but the format's key is `tree` - `rooms()`,
   `functions()` and `membership()` were empty against a real system (B-1).
 

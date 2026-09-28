@@ -346,15 +346,56 @@ export class OccuLite {
         }
     }
 
-    /** The names followed (the stream's interface= filter). */
-    private interfaceNames(): string[] {
-        return this.interfaces.map((i) => i.name);
+    /** The stream's and the state read's interface= filter: the consumer's choice, or none - a
+     *  filter would hide the `interface added` of one that appears later (the system matches
+     *  interface events by the filter too), and a client that wants everything saves nothing by it. */
+    private interfaceFilter(): string[] {
+        return this.opts.interfaces ? this.interfaces.map((i) => i.name) : [];
+    }
+
+    /** ready() waits for the device lists of the running interfaces; a stopped one is reported
+     *  through `interface {state: 'down'}` and its list taken when it comes. */
+    private checkDevicesReady(): void {
+        if (this.devicesWaiter && this.interfaces.filter((i) => i.running).every((i) => this.devicesSeen.has(i.name))) {
+            this.devicesWaiter();
+            this.devicesWaiter = undefined;
+        }
     }
 
     private setInterfaceState(name: string, running: boolean): void {
         const cur = this.interfaces.find((i) => i.name === name);
         if (cur) cur.running = running;
         else if (!this.opts.interfaces || this.opts.interfaces.includes(name)) this.interfaces.push({name, running});
+    }
+
+    private fetching = new Set<string>();
+
+    /** listDevices of one interface (a late one, or a newDevices that named addresses only): the
+     *  descriptions go into box.devices and out as one `devices {kind: 'new'}` event with them. */
+    private async fetchDevices(iface: string, addresses?: string[]): Promise<void> {
+        if (this.opts.devices === false || this.mode !== 'full' || this.fetching.has(iface)) return;
+        this.fetching.add(iface);
+        try {
+            const list = await this.call<Record<string, unknown>[]>(iface, 'listDevices');
+            const want = addresses ? new Set(addresses) : undefined;
+            const descs: Record<string, unknown>[] = [];
+            for (const desc of Array.isArray(list) ? list : []) {
+                const a = desc?.ADDRESS as string | undefined;
+                if (!a) continue;
+                const known = this.devices.has(mkRef(iface, a));
+                this.devices.set(mkRef(iface, a), desc);
+                if (want ? want.has(a) : !known) descs.push(desc);
+            }
+            this.devicesSeen.add(iface);
+            this.checkDevicesReady();
+            this.opts.log?.debug?.(`occulite-client: listDevices on ${iface}: ${Array.isArray(list) ? list.length : 0} descriptions, ${descs.length} new`);
+            if (descs.length || want) this.emit('devices', {kind: 'new', interface: iface, refs: descs.map((x) => mkRef(iface, x.ADDRESS as string)), descriptions: descs});
+        } catch (e) {
+            this.opts.log?.warn?.(`occulite-client: listDevices on ${iface} failed: ${(e as Error).message}`);
+            if (addresses) this.emit('devices', {kind: 'new', interface: iface, refs: addresses.map((a) => mkRef(iface, a))});
+        } finally {
+            this.fetching.delete(iface);
+        }
     }
 
     /** Closes the streams; the client is done. */
@@ -371,7 +412,7 @@ export class OccuLite {
         let eventId = '';
         for (let page = 0; page < 1000; page++) {
             const q = new URLSearchParams({limit: '5000'});
-            for (const i of this.interfaceNames()) q.append('interface', i);
+            for (const i of this.interfaceFilter()) q.append('interface', i);
             if (after) q.set('after', after);
             const r = await this.request<{entries: any[]; next?: string; event_id?: string}>('GET', `/api/rpc/v1/state?${q}`, undefined, {signal});
             if (page === 0) eventId = r.event_id ?? '';
@@ -431,7 +472,7 @@ export class OccuLite {
         const maxDelay = this.opts.reconnect?.max ?? 30000;
         while (!this.abort.signal.aborted) {
             const q = new URLSearchParams();
-            for (const i of this.interfaceNames()) q.append('interface', i);
+            for (const i of this.interfaceFilter()) q.append('interface', i);
             // the device lists with the stream while ready() still waits for them (a dropped stream asks again)
             if (this.opts.devices !== false && this.devicesWaiter) q.set('devices', '1');
             const h = this.headers();
@@ -487,6 +528,7 @@ export class OccuLite {
                     if (this.interfacesListed && !this.interfaces.some((x) => x.name === i.name)) continue;
                     this.setInterfaceState(i.name, i.state !== 'down');
                 }
+                this.checkDevicesReady();
                 if (this.status === 'degraded') this.setStatus('ready');
                 break;
             }
@@ -508,6 +550,9 @@ export class OccuLite {
                 if (typeof d.interface === 'string') {
                     if (d.state === 'removed') this.interfaces = this.interfaces.filter((i) => i.name !== d.interface);
                     else this.setInterfaceState(d.interface, d.state !== 'down');
+                    // one that came up after connect (hmipserver after rfd, a stopped hs485d started): its devices
+                    if ((d.state === 'added' || d.state === 'up' || d.state === 'restarted') && this.interfaces.some((i) => i.name === d.interface)) void this.fetchDevices(d.interface);
+                    this.checkDevicesReady();
                 }
                 this.emit('interface', {interface: d.interface, state: d.state});
                 break;
@@ -520,10 +565,18 @@ export class OccuLite {
                 if (Array.isArray(d.devices)) {
                     for (const desc of d.devices) if (desc?.ADDRESS) this.devices.set(mkRef(d.interface, desc.ADDRESS), desc);
                     this.devicesSeen.add(d.interface);
-                    if (this.devicesWaiter && this.interfaces.every((i) => this.devicesSeen.has(i.name))) {
-                        this.devicesWaiter();
-                        this.devicesWaiter = undefined;
-                    }
+                    this.checkDevicesReady();
+                } else if (event === 'newDevices' && d.error !== undefined) {
+                    // the ?devices=1 snapshot of an interface that did not answer: nothing to wait for
+                    this.opts.log?.warn?.(`occulite-client: no device list from ${d.interface}: ${d.error}`);
+                    this.setInterfaceState(d.interface, false);
+                    this.devicesSeen.add(d.interface);
+                    this.checkDevicesReady();
+                    break;
+                } else if (event === 'newDevices' && this.opts.devices !== false && Array.isArray(d.addresses) && this.mode === 'full') {
+                    // the live event carries addresses only: the descriptions come from listDevices, then the event
+                    void this.fetchDevices(d.interface, d.addresses);
+                    break;
                 }
                 if (event === 'deleteDevices') {
                     for (const a of d.addresses ?? []) {

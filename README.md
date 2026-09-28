@@ -97,6 +97,15 @@ lite-rpc's paths take them - narrowed to `interfaces: [...]` when you pass one. 
 tells the radio hardware): a credential without it, or an older system without the route, is no failure - your
 `interfaces` option stands, and the stream's `hello` names the rest. `running` follows the `interface` events.
 
+**Interfaces that are not running, and ones that appear later.** `ready()` waits for the device lists of the
+running interfaces only: a stopped `hs485d` does not hold it for `readyTimeout`; it is `running: false` in
+`box.interfaces`, reported through `on('interface')`, and its devices are taken when it comes up. An interface that
+appears after connect - hmipserver starting after rfd on a system that starts your program early - is followed: the
+client reads its device list (`listDevices`) and reports it as a `devices {kind: 'new'}` event with the
+descriptions, as a CCU's `newDevices` would. Without an `interfaces` option the stream is opened without an interface
+filter, so nothing that appears later is hidden by it; with one, only the named interfaces are followed. A live
+`newDevices` that names addresses only (a device paired) gets its descriptions the same way before the event goes out.
+
 ### Authentication
 
 `auth: {token}` (a paired or created API token) or `auth: {session}` (a browser session id) go as
