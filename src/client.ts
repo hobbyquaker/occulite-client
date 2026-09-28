@@ -7,7 +7,7 @@
 
 import {OccuLiteError, abortError, httpError, timeoutSignal} from './errors.ts';
 import {MetaCopy, type MetaDocument, type MetaEvent} from './meta.ts';
-import {datapointRef, parseDatapointRef, parseRef, ref as mkRef} from './refs.ts';
+import {datapointRef, deviceOf, parseDatapointRef, parseRef, ref as mkRef} from './refs.ts';
 import {parseSSE} from './sse.ts';
 import {fetchTransport, type Transport} from './transport.ts';
 
@@ -46,8 +46,12 @@ export interface Options {
     transport?: Transport;
     /** the interfaces to follow; default every interface the system offers */
     interfaces?: string[];
-    /** load the state store at connect (default true, when the system has one) */
-    values?: boolean;
+    /** load the state store at connect (default true, when the system has one); 'all' also sweeps
+     *  the datapoints the store does not keep with a paced getParamset(VALUES) per channel after
+     *  ready() (the `sweep` event says when it is done) */
+    values?: boolean | 'all';
+    /** the sweep's pace, ms between two getParamset calls; default 200 (rfd serialises them at about five a second) */
+    sweepPaceMs?: number;
     /** keep a live copy of names and taxonomy (default true) */
     meta?: boolean;
     /** the device descriptions at connect and their changes (default true) */
@@ -73,6 +77,24 @@ export interface Value {
     lc?: number;
     /** false for a value the system restored from its own file that no device has reported since */
     confirmed: boolean;
+    /** where it came from: event, sweep (the client's or the system's), restored */
+    source?: string;
+}
+
+/** What one sweep did (the `sweep` event, and sweep()'s answer). */
+export interface SweepResult {
+    done: true;
+    /** channels asked */
+    channels: number;
+    /** channels whose getParamset answered */
+    read: number;
+    /** channels the process faulted on (a BidCos device that did not answer, say) */
+    failed: number;
+    /** channels left out: no VALUES paramset, the device UNREACH, every key in the store */
+    skipped: number;
+    /** datapoints added to box.values */
+    values: number;
+    seconds: number;
 }
 
 export interface ValueEvent extends Value {
@@ -165,6 +187,9 @@ export class OccuLite {
     private devicesWaiter: (() => void) | undefined;
     private metaRefresh: ReturnType<typeof setTimeout> | undefined;
     private resyncing = false;
+    /** the keys the state store keeps (its first page's `datapoints`); the sweep asks for the rest */
+    private storeKeys: Set<string> | undefined;
+    private sweeping: Promise<SweepResult> | undefined;
     /** the list came from the interfaces route (else it is a guess the stream's hello completes) */
     private interfacesListed = false;
 
@@ -321,6 +346,7 @@ export class OccuLite {
         }
         if (signal?.aborted) throw abortError(signal, 'connecting');
         this.setStatus('ready');
+        if (this.opts.values === 'all' && rpc) void this.sweep();
     }
 
     /** The interfaces this system runs, typed: GET /api/rpc/v1/interfaces (needs rpc:read). */
@@ -390,6 +416,7 @@ export class OccuLite {
             this.checkDevicesReady();
             this.opts.log?.debug?.(`occulite-client: listDevices on ${iface}: ${Array.isArray(list) ? list.length : 0} descriptions, ${descs.length} new`);
             if (descs.length || want) this.emit('devices', {kind: 'new', interface: iface, refs: descs.map((x) => mkRef(iface, x.ADDRESS as string)), descriptions: descs});
+            if (descs.length && this.opts.values === 'all' && this.status === 'ready') void this.sweep(descs.map((x) => mkRef(iface, x.ADDRESS as string)));
         } catch (e) {
             this.opts.log?.warn?.(`occulite-client: listDevices on ${iface} failed: ${(e as Error).message}`);
             if (addresses) this.emit('devices', {kind: 'new', interface: iface, refs: addresses.map((a) => mkRef(iface, a))});
@@ -414,9 +441,12 @@ export class OccuLite {
             const q = new URLSearchParams({limit: '5000'});
             for (const i of this.interfaceFilter()) q.append('interface', i);
             if (after) q.set('after', after);
-            const r = await this.request<{entries: any[]; next?: string; event_id?: string}>('GET', `/api/rpc/v1/state?${q}`, undefined, {signal});
-            if (page === 0) eventId = r.event_id ?? '';
-            for (const e of r.entries) this.values.set(datapointRef(e.interface, e.address, e.datapoint), {value: e.value, ts: ms(e.ts) ?? 0, lc: ms(e.lc), confirmed: !!e.confirmed});
+            const r = await this.request<{entries: any[]; next?: string; event_id?: string; datapoints?: string[]}>('GET', `/api/rpc/v1/state?${q}`, undefined, {signal});
+            if (page === 0) {
+                eventId = r.event_id ?? '';
+                if (Array.isArray(r.datapoints)) this.storeKeys = new Set(r.datapoints);
+            }
+            for (const e of r.entries) this.values.set(datapointRef(e.interface, e.address, e.datapoint), {value: e.value, ts: ms(e.ts) ?? 0, lc: ms(e.lc), confirmed: !!e.confirmed, source: e.source});
             if (!r.next) break;
             after = r.next;
         }
@@ -463,6 +493,79 @@ export class OccuLite {
         }
         if (s.status !== 200) clearTimeout(timer);
         return {status: s.status, body: s.body, messages: messages()};
+    }
+
+    // ---- the sweep: the datapoints the state store does not keep ---------------------------------
+
+    /** Reads the VALUES of every channel (or of the refs given: channels, or devices for their
+     *  channels) with one paced getParamset each and puts the datapoints box.values does not have
+     *  yet in it as {source: 'sweep'}, each as a `value` event (which `callbacks` does not turn into
+     *  an `event` call). Answered from hmipserver's cache for HmIP; rfd asks a BidCos actuator on the
+     *  air for every call (openccu-lite task 287), so a channel is read once and never as a poll, and
+     *  a BidCos device that is UNREACH is left out. One sweep at a time; a second call waits for it. */
+    sweep(refs?: string[]): Promise<SweepResult> {
+        const run = async (): Promise<SweepResult> => {
+            const t0 = Date.now();
+            const res: SweepResult = {done: true, channels: 0, read: 0, failed: 0, skipped: 0, values: 0, seconds: 0};
+            for (const ref of this.sweepTargets(refs)) {
+                if (this.abort.signal.aborted) break;
+                const {interface: i, address} = parseRef(ref);
+                const desc = this.devices.get(ref);
+                if (this.skipSweep(i, address, desc)) {
+                    res.skipped++;
+                    continue;
+                }
+                res.channels++;
+                try {
+                    const values = await this.call<Record<string, unknown>>(i, 'getParamset', [address, 'VALUES']);
+                    res.read++;
+                    const ts = Date.now();
+                    for (const [key, value] of Object.entries(values ?? {})) {
+                        const r = datapointRef(i, address, key);
+                        if (this.values.has(r)) continue; // the store's entry is the fresher one (ts, lc, confirmed)
+                        const v: Value = {value, ts, lc: undefined, confirmed: true, source: 'sweep'};
+                        this.values.set(r, v);
+                        res.values++;
+                        this.emit('value', {ref: r, interface: i, address, key, ...v} as ValueEvent);
+                    }
+                } catch (e) {
+                    res.failed++;
+                    this.opts.log?.debug?.(`occulite-client: sweep: getParamset(${ref}, VALUES) failed: ${(e as Error).message}`);
+                }
+                await new Promise((r) => setTimeout(r, this.opts.sweepPaceMs ?? 200));
+            }
+            res.seconds = Math.round((Date.now() - t0) / 100) / 10;
+            this.emit('sweep', res);
+            return res;
+        };
+        const p = (this.sweeping ?? Promise.resolve()).then(run, run);
+        this.sweeping = p;
+        p.finally(() => {
+            if (this.sweeping === p) this.sweeping = undefined;
+        });
+        return p;
+    }
+
+    /** The channels to sweep: every channel of box.devices, or the refs given (a device stands for its channels). */
+    private sweepTargets(refs?: string[]): string[] {
+        const all = [...this.devices.keys()].filter((r) => parseRef(r).address.includes(':')).sort();
+        if (!refs) return all;
+        const want = new Set(refs);
+        return all.filter((r) => want.has(r) || want.has(r.slice(0, r.lastIndexOf(':'))));
+    }
+
+    private skipSweep(iface: string, address: string, desc: Record<string, unknown> | undefined): boolean {
+        const paramsets = desc?.PARAMSETS;
+        if (Array.isArray(paramsets) && !paramsets.includes('VALUES')) return true;
+        // a BidCos device that does not answer costs rfd's retries on the air for nothing; hmipserver answers from its cache
+        if (!/^HmIP/i.test(iface)) {
+            const dev = deviceOf(address);
+            if (this.values.get(datapointRef(iface, `${dev}:0`, 'UNREACH'))?.value === true) return true;
+        }
+        // a channel whose VALUES description is at hand and names only keys the store keeps has nothing to add
+        const known = this.cachedDescription(mkRef(iface, address));
+        if (known && this.storeKeys && Object.keys(known).every((k) => this.storeKeys!.has(k) || (k.startsWith('ERROR_') && this.storeKeys!.has('ERROR_*')))) return true;
+        return false;
     }
 
     // ---- the RPC event stream ------------------------------------------------------------------
@@ -690,6 +793,13 @@ export class OccuLite {
         });
     }
 
+    private descKnown = new Map<string, Record<string, ParamDesc>>();
+
+    /** A VALUES description already fetched, without a request; undefined otherwise. */
+    private cachedDescription(channelRef: string): Record<string, ParamDesc> | undefined {
+        return this.descKnown.get(`${channelRef}|VALUES`);
+    }
+
     /** A channel's paramset description, cached per channel. */
     paramsetDescription(channelRef: string, paramset = 'VALUES'): Promise<Record<string, ParamDesc>> {
         const k = `${channelRef}|${paramset}`;
@@ -697,7 +807,7 @@ export class OccuLite {
         if (!p) {
             const {interface: i, address} = parseRef(channelRef);
             p = this.call<Record<string, ParamDesc>>(i, 'getParamsetDescription', [address, paramset]);
-            p.catch(() => this.descCache.delete(k));
+            p.then((d) => this.descKnown.set(k, d)).catch(() => this.descCache.delete(k));
             this.descCache.set(k, p);
         }
         return p;

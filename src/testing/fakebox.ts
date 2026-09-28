@@ -30,8 +30,12 @@ export interface FakeBoxOptions {
     devices?: Record<string, Record<string, unknown>[]>;
     /** VALUES paramset descriptions by `<interface>.<channel>` */
     descriptions?: Record<string, Record<string, {TYPE: string; OPERATIONS?: number}>>;
-    /** `<interface>.<address>.<KEY>` → value */
+    /** `<interface>.<address>.<KEY>` → value: what getParamset(VALUES) and getValue answer */
     values?: Record<string, FakeValue>;
+    /** the keys the state store keeps (the system's chosen set); default: every key in `values` */
+    storeKeys?: string[];
+    /** channels (`<interface>.<address>`) whose getParamset faults with -1 Failure (a BidCos device away) */
+    failing?: string[];
     meta?: {revision: number; objects: Record<string, unknown>; enums: Record<string, unknown>};
     capabilities?: Record<string, unknown>;
     /** approve every pairing request as soon as the program revealed its half */
@@ -280,12 +284,14 @@ export class FakeBox {
                     return {interface: r.slice(0, i), address: r.slice(i + 1, j), datapoint: r.slice(j + 1), value: v.value, ts: v.ts ?? new Date(0).toISOString(), lc: v.lc ?? v.ts ?? new Date(0).toISOString(), confirmed: v.confirmed ?? true, source: v.source ?? 'event'};
                 })
                 .filter((e) => !want.length || want.includes(e.interface))
+                .filter((e) => !this.opts.storeKeys || this.opts.storeKeys.includes(e.datapoint))
                 .sort((a, b) => (`${a.interface}/${a.address}/${a.datapoint}` < `${b.interface}/${b.address}/${b.datapoint}` ? -1 : 1));
             const limit = Number(u.searchParams.get('limit') ?? 1000);
             const after = u.searchParams.get('after') ?? '';
             const from = after ? entries.findIndex((e) => `${e.interface}/${e.address}/${e.datapoint}` > after) : 0;
             const page = from < 0 ? [] : entries.slice(from, from + limit);
             const out: Record<string, unknown> = {entries: page, total: entries.length, unconfirmed: entries.filter((e) => !e.confirmed).length, event_id: `${this.bootId}-${this.seq}`};
+            if (!after) out.datapoints = this.opts.storeKeys ?? [...new Set(entries.map((e) => e.datapoint))];
             if (from >= 0 && from + limit < entries.length) out.next = `${page.at(-1)!.interface}/${page.at(-1)!.address}/${page.at(-1)!.datapoint}`;
             return this.json(res, 200, out);
         }
@@ -333,8 +339,14 @@ export class FakeBox {
                     case 'setValue':
                     case 'putParamset':
                         return {jsonrpc: '2.0', id: c.id, result: ''};
-                    case 'getParamset':
-                        return {jsonrpc: '2.0', id: c.id, result: {}};
+                    case 'getParamset': {
+                        if (this.opts.failing?.includes(`${iface}.${addr}`)) return {jsonrpc: '2.0', id: c.id, error: {code: -1, message: 'Failure'}};
+                        if (a2 !== 'VALUES') return {jsonrpc: '2.0', id: c.id, result: {}};
+                        const out: Record<string, unknown> = {};
+                        const prefix = `${iface}.${addr}.`;
+                        for (const [r, v] of Object.entries(this.opts.values ?? {})) if (r.startsWith(prefix) && !r.slice(prefix.length).includes('.')) out[r.slice(prefix.length)] = v.value;
+                        return {jsonrpc: '2.0', id: c.id, result: out};
+                    }
                 }
                 return {jsonrpc: '2.0', id: c.id, error: {code: -32601, message: `unknown method ${c.method}`}};
             };

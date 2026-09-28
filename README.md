@@ -71,7 +71,7 @@ await box.ready({signal})                       // rejects unauthenticated | for
 
 box.interfaces                                      // [{name, protocol, url_path, running}] - live
 await box.listInterfaces()                          // the same from GET /api/rpc/v1/interfaces (needs rpc:read)
-box.values.get('HmIP-RF.000A1B2C3D4E5F:1.STATE')    // {value, ts, lc, confirmed}
+box.values.get('HmIP-RF.000A1B2C3D4E5F:1.STATE')    // {value, ts, lc, confirmed, source}
 box.on('value', ev => {})                           // {ref, interface, address, key, value, ts, lc, confirmed, batch?}
 box.on('batch', events => {})                       // one system.multicall's events together
 box.on('resync', ({reason}) => {})                  // after a gap or another boot: republish if you cache
@@ -85,6 +85,19 @@ await box.history('HmIP-RF.000A1B2C3D4E5F:1.ACTUAL_TEMPERATURE', {maxPoints: 288
 ```
 
 In a browser on the system itself, `auth: {session}` with the page's session, and the default `fetch` transport.
+
+**Every value, or the state store's.** `box.values` is filled from the system's state store at connect - but the
+store keeps only a chosen set of datapoints (what the system's own cards draw, and the service datapoints such as
+`UNREACH` and `LOWBAT`), not every one a channel has. A program that wants everything (a retained topic per datapoint,
+a value cache) passes **`values: 'all'`**: after `ready()` the client reads the `VALUES` of every channel with one
+`getParamset` each, paced (`sweepPaceMs`, default 200 ms), and puts what the store did not have into `box.values` as
+`{source: 'sweep', confirmed: true, lc: undefined}`, each as a `value` event with `source: 'sweep'` (the `callbacks`
+module turns no such value into an `event` call). The **`sweep`** event `{done, channels, read, failed, skipped,
+values, seconds}` says when it is through; `box.sweep(refs?)` runs it again, for everything or for the channels (or
+devices) named - a device paired later is swept on its own. On the air it costs nothing for HmIP (hmipserver answers
+from its cache); rfd asks a BidCos actuator for its status on every `getParamset(VALUES)`, so the sweep reads a BidCos
+channel once and never as a poll, and leaves out a BidCos device whose `UNREACH` is set. The stream keeps everything
+current afterwards.
 
 **Timeouts.** Every request has one - `timeout` (default 30 s; `box.request(…, {timeout, signal})` per call) - and
 rejects `timeout`, never `unreachable`, when the system does not answer in time. `connectTimeout` (default 60 s)

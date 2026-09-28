@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `values: 'all'`: a paced `getParamset(VALUES)` sweep after `ready()` for the datapoints the state store does not
+  keep (`sweepPaceMs`, default 200 ms; the `sweep` event with its counts; `box.sweep(refs?)` for a re-run or a device
+  paired later). Swept values carry `source: 'sweep'`, `confirmed: true` and no `lc`; the store's entries are never
+  overwritten; a BidCos device whose `UNREACH` is set is left out (rfd asks the device on the air for every call). `Value`
+  gained `source`. `FakeBox`: `storeKeys`, `failing`, `getParamset(VALUES)` answers the channel's values, the state's
+  first page names `datapoints`.
+
 - `ready()` waits for the device lists of the running interfaces only (a stopped process no longer holds it for
   `readyTimeout`; the system's `newDevices {error}` snapshot for it is taken as "nothing to wait for"). An interface
   that appears or comes up after connect is followed: `listDevices` once, the descriptions into `box.devices` and out
