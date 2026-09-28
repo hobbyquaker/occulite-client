@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import {after, before, test} from 'node:test';
 import {callbackEvents} from '../src/callbacks.ts';
-import {OccuLite, type ValueEvent} from '../src/client.ts';
+import {OccuLite, REQUEST_HEADER, type ValueEvent} from '../src/client.ts';
 import {OccuLiteError} from '../src/errors.ts';
 import {pair} from '../src/node/index.ts';
 import {FakeBox} from '../src/testing/fakebox.ts';
+import {fetchTransport, type Transport} from '../src/transport.ts';
 
 const until = async (f: () => boolean, ms = 3000) => {
     const end = Date.now() + ms;
@@ -151,4 +152,38 @@ test('rotation: the client uses the new secret', async () => {
     assert.equal(auth.token, t);
     await c.request('GET', '/api/auth/v1/state');
     c.close();
+});
+
+test('X-Occulite-Request on every request: a cookie-only write passes, one without the header is refused', async (t) => {
+    // a browser on the system: no auth option, the session cookie rides along (here: added by the transport)
+    const sid = 'SESSIONIDABCDEFGHIJKLMNOPQ';
+    const cookieBox = new FakeBox({session: sid, meta: {revision: 1, objects: {}, enums: {}}});
+    await cookieBox.start();
+    t.after(() => cookieBox.stop());
+    const inner = fetchTransport();
+    const sent: {url: string; headers: Record<string, string>}[] = [];
+    const cookieTransport: Transport = {
+        request: (m, u, h, b, s) => {
+            sent.push({url: u, headers: h});
+            return inner.request(m, u, {...h, Cookie: `occulite_session=${sid}`}, b, s);
+        },
+        stream: (u, h, s) => {
+            sent.push({url: u, headers: h});
+            return inner.stream(u, {...h, Cookie: `occulite_session=${sid}`}, s);
+        },
+    };
+    const c = new OccuLite({url: cookieBox.url, transport: cookieTransport, values: false, devices: false});
+    t.after(() => c.close());
+    await c.ready();
+    await c.rename('HmIP-RF.000A1B2C3D4E5F:4', 'Lampe');
+    assert.deepEqual(cookieBox.metaPatches.at(-1), {ref: 'HmIP-RF.000A1B2C3D4E5F:4', body: {name: 'Lampe'}});
+    assert.ok(sent.length >= 4, 'version, state, interfaces, snapshot, the streams, the PATCH');
+    for (const s of sent) assert.equal(s.headers[REQUEST_HEADER], '1', `${s.url} carries the header`);
+    // the same write without the header: the system refuses it (as occulited does since task 259)
+    const raw = await fetch(`${cookieBox.url}/api/meta/v1/objects/x`, {method: 'PATCH', headers: {Cookie: `occulite_session=${sid}`, 'Content-Type': 'application/json'}, body: '{}'});
+    assert.equal(raw.status, 403);
+    assert.equal(((await raw.json()) as {error: string}).error, 'request-header');
+    // a Bearer needs none
+    const bearer = await fetch(`${cookieBox.url}/api/meta/v1/objects/x`, {method: 'PATCH', headers: {Authorization: `Bearer ${sid}`, 'Content-Type': 'application/json'}, body: '{}'});
+    assert.equal(bearer.status, 200);
 });

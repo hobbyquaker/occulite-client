@@ -8,6 +8,7 @@ import https from 'node:https';
 import * as net from 'node:net';
 import * as tls from 'node:tls';
 import type {TLSSocket} from 'node:tls';
+import {REQUEST_HEADER} from '../client.ts';
 import {OccuLiteError, httpError, type CertificateInfo} from '../errors.ts';
 import type {Transport, TransportResponse} from '../transport.ts';
 
@@ -190,12 +191,12 @@ export async function pair(o: PairOptions): Promise<Paired> {
     const clientNonce = randomBytes(16);
     const commit = createHash('sha256').update(clientNonce).digest('hex');
     const body = JSON.stringify({app: o.app, app_version: o.appVersion, instance: o.instance, name: o.name, access: o.access, purpose: o.purpose, commit});
-    const r = await tx.request('POST', `${url}/api/auth/v1/pairing/request`, {'Content-Type': 'application/json'}, body, o.signal);
+    const r = await tx.request('POST', `${url}/api/auth/v1/pairing/request`, {'Content-Type': 'application/json', [REQUEST_HEADER]: '1'}, body, o.signal);
     const ans = JSON.parse(r.body || '{}');
     if (r.status !== 202) throw httpError(r.status, ans);
     const seen = url.startsWith('https:') ? tx.lastFingerprint() ?? '' : '';
     const code = pairingCode(Buffer.from(ans.nonce, 'hex'), clientNonce, seen ? Buffer.from(norm(seen), 'hex') : Buffer.alloc(0));
-    const auth = {Authorization: `Pairing ${ans.poll}`};
+    const auth = {Authorization: `Pairing ${ans.poll}`, [REQUEST_HEADER]: '1'};
     const pollURL = `${url}/api/auth/v1/pairing/request/${encodeURIComponent(ans.id)}`;
     let first = true;
     const withdraw = () => void tx.request('DELETE', pollURL, auth).catch(() => {});

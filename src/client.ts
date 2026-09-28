@@ -14,6 +14,11 @@ import {fetchTransport, type Transport} from './transport.ts';
 /** The API majors this client speaks. */
 export const SPEAKS = {meta: 1, rpc: 1, system: 1, auth: 1};
 
+/** The header every request carries: occulited refuses a state-changing call whose only credential
+ *  is the session cookie without it (a custom header cannot ride on a cross-site form post or a
+ *  link). Harmless beside a Bearer. */
+export const REQUEST_HEADER = 'X-Occulite-Request';
+
 export interface Auth {
     /** an API token (olt_…), sent as the bearer credential */
     token?: string;
@@ -157,7 +162,7 @@ export class OccuLite {
     // ---- HTTP --------------------------------------------------------------------------------
 
     private headers(extra: Record<string, string> = {}): Record<string, string> {
-        const h: Record<string, string> = {...extra};
+        const h: Record<string, string> = {[REQUEST_HEADER]: '1', ...extra};
         const a = this.opts.auth;
         if (a?.token) h.Authorization = `Bearer ${a.token}`;
         else if (a?.session) h.Authorization = `Bearer ${a.session}`;

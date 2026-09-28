@@ -18,6 +18,9 @@ export interface FakeValue {
 
 export interface FakeBoxOptions {
     token?: string;
+    /** a browser session id: accepted as the cookie `occulite_session=<id>` or as a Bearer; a
+     *  state-changing call on the cookie alone must carry X-Occulite-Request (403 request-header) */
+    session?: string;
     scopes?: string[];
     interfaces?: string[];
     /** device descriptions per interface (listDevices) */
@@ -78,9 +81,19 @@ export class FakeBox {
         res.end(JSON.stringify(body));
     }
 
-    private authorized(req: http.IncomingMessage): boolean {
-        if (!this.opts.token) return true;
-        return req.headers.authorization === `Bearer ${this.opts.token}`;
+    /** The credential check as occulited does it: 0 = passes, 401 = none, 403 = the cookie alone
+     *  on a state-changing call without the request header. */
+    private authorized(req: http.IncomingMessage): 0 | 401 | 403 {
+        if (!this.opts.token && !this.opts.session) return 0;
+        const bearer = req.headers.authorization;
+        if (this.opts.token && bearer === `Bearer ${this.opts.token}`) return 0;
+        if (this.opts.session && bearer === `Bearer ${this.opts.session}`) return 0;
+        const cookie = /(?:^|;\s*)(?:__Secure-)?occulite_session=([^;]+)/.exec(req.headers.cookie ?? '')?.[1];
+        if (this.opts.session && cookie === this.opts.session) {
+            const safe = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+            return safe || bearer || req.headers['x-occulite-request'] ? 0 : 403;
+        }
+        return 401;
     }
 
     private send(res: http.ServerResponse, id: string | undefined, event: string, data: unknown): void {
@@ -184,7 +197,9 @@ export class FakeBox {
             }
             return this.json(res, 200, {state: p.state});
         }
-        if (!this.authorized(req)) return this.json(res, 401, {error: 'unauthenticated', message: 'login required'});
+        const verdict = this.authorized(req);
+        if (verdict === 401) return this.json(res, 401, {error: 'unauthenticated', message: 'login required'});
+        if (verdict === 403) return this.json(res, 403, {error: 'request-header', message: 'a state-changing call with the session cookie alone must carry the header X-Occulite-Request'});
         if (key === 'GET /api/auth/v1/state') return this.json(res, 200, {authenticated: true, scopes: this.opts.scopes ?? ['*']});
         if (key === 'POST /api/auth/v1/tokens/self/rotate') {
             this.opts.token = `olt_${randomBytes(16).toString('hex')}`;

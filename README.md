@@ -64,6 +64,16 @@ await box.history('HmIP-RF.000A1B2C3D4E5F:1.ACTUAL_TEMPERATURE', {maxPoints: 288
 
 In a browser on the system itself, `auth: {session}` with the page's session, and the default `fetch` transport.
 
+### Authentication
+
+`auth: {token}` (a paired or created API token) or `auth: {session}` (a browser session id) go as
+`Authorization: Bearer`. Without either, the default `fetch` transport rides on the browser's session cookie
+(`credentials: 'same-origin'`) - so a page served by the system itself needs no option at all. Every request the
+client makes carries the header **`X-Occulite-Request: 1`**: openccu-lite refuses a state-changing call whose only
+credential is the session cookie without it (`403 request-header`; a custom header is what a cross-site form post
+or link cannot send). A Bearer needs no such header; the client sends it anyway, which is harmless. A program that
+talks to the API on its own (not through this client) and replays the cookie for its writes has to send it too.
+
 ## Handlers written for a callback server
 
 ```js
