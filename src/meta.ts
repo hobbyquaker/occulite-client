@@ -19,6 +19,9 @@ export interface MetaNode {
 
 export interface MetaEnum {
     name?: string | Record<string, string>;
+    /** the nodes, ordered (docs/meta-format.md: `tree`) */
+    tree?: MetaNode[];
+    /** @deprecated 0.1.0 read `nodes`/`children`; the format's key is `tree` */
     nodes?: MetaNode[];
     children?: MetaNode[];
 }
@@ -123,7 +126,7 @@ export class MetaCopy {
                 walk(n.children, path);
             }
         };
-        walk(e.nodes ?? e.children, enumId);
+        walk(e.tree ?? e.nodes ?? e.children, enumId);
         for (const [ref, o] of Object.entries(this.doc.objects)) {
             for (const p of o.enums ?? []) {
                 for (const n of out) {

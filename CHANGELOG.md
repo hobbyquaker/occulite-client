@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed: `MetaCopy` read an enum's nodes from `nodes`/`children`, but the format's key is `tree` - `rooms()`,
+  `functions()` and `membership()` were empty against a real system (B-1).
+
 - Credentials: `auth` takes an `AuthProvider` beside `{token}`/`{session}`; `occulite-client/node` has
   `nodeAuth('auto' | {token} | {session} | {addon} | {local: true})` - `'auto'` is `OCCULITE_TOKEN`, the addon's
   token file, the local token, none - and `createClient({url, auth, trust, addon, …})` wiring it with the pinned

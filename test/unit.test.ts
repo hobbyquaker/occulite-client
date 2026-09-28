@@ -36,7 +36,8 @@ test('the pairing code is the system\'s (the Go side\'s vectors)', () => {
 
 test('the metadata copy: events in place, a gap asks for a snapshot, the tree', () => {
     const m = new MetaCopy();
-    m.load({format: 1, revision: 5, objects: {'HmIP-RF.A:1': {name: 'Lampe', enums: ['room/eg/wz']}}, enums: {room: {name: {en: 'Rooms'}, children: [{id: 'eg', name: 'EG', children: [{id: 'wz', name: 'Wohnzimmer'}]}]}, function: {children: [{id: 'licht', name: {de: 'Licht', en: 'Light'}}]}}});
+    // the format's shape: enums.<id>.tree, nodes with children (docs/meta-format.md)
+    m.load({format: 1, revision: 5, objects: {'HmIP-RF.A:1': {name: 'Lampe', enums: ['room/eg/wz']}}, enums: {room: {name: {en: 'Rooms'}, tree: [{id: 'eg', name: 'EG', children: [{id: 'wz', name: 'Wohnzimmer'}]}]}, function: {tree: [{id: 'licht', name: {de: 'Licht', en: 'Light'}}]}}});
     assert.equal(m.name('HmIP-RF.A:1'), 'Lampe');
     assert.equal(m.apply({revision: 6, kind: 'object.updated', ref: 'HmIP-RF.B:1', value: {name: 'Kontakt', enums: ['function/licht']}}), true);
     assert.equal(m.apply({revision: 6, kind: 'object.updated', ref: 'HmIP-RF.B:1', value: {}}), true, 'a replay is ignored');
