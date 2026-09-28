@@ -66,6 +66,16 @@ export interface ValueEvent extends Value {
     source?: string;
 }
 
+/** One interface the system runs, as GET /api/rpc/v1/interfaces answers it (the names are the
+ *  InterfacesList.xml names lite-rpc's paths take). */
+export interface InterfaceInfo {
+    name: string;
+    protocol?: string;
+    url_path?: string;
+    /** the subscriber's view: the process answered its last init or ping */
+    running: boolean;
+}
+
 export interface Capabilities {
     pairing?: boolean;
     state?: boolean;
@@ -103,7 +113,9 @@ export class OccuLite {
     info: Info = {};
     capabilities: Capabilities = {};
     scopes: string[] = [];
-    interfaces: string[] = [];
+    /** the interfaces followed, with their state: from GET /api/rpc/v1/interfaces (rpc:read), else
+     *  learned from the stream's hello; kept live from the interface events */
+    interfaces: InterfaceInfo[] = [];
     readonly values = new Map<string, Value>();
     /** device and channel descriptions by ref */
     readonly devices = new Map<string, Record<string, unknown>>();
@@ -126,6 +138,8 @@ export class OccuLite {
     private devicesWaiter: (() => void) | undefined;
     private metaRefresh: ReturnType<typeof setTimeout> | undefined;
     private resyncing = false;
+    /** the list came from the interfaces route (else it is a guess the stream's hello completes) */
+    private interfacesListed = false;
 
     constructor(opts: Options) {
         this.opts = opts;
@@ -213,14 +227,47 @@ export class OccuLite {
         }
         const st = await this.request<{scopes?: string[]; authenticated?: boolean}>('GET', '/api/auth/v1/state').catch(() => ({scopes: []}));
         this.scopes = st.scopes ?? [];
-        const ifs = await this.request<{name: string}[]>('GET', '/api/rpc/v1/interfaces');
-        this.interfaces = (this.opts.interfaces ?? ifs.map((i) => i.name)).filter((n) => ifs.some((i) => i.name === n));
+        await this.loadInterfaces();
         await Promise.all([this.opts.values === false ? undefined : this.loadValues(), this.opts.meta === false ? undefined : this.loadMeta()]);
         const devicesDone = this.opts.devices === false ? Promise.resolve() : new Promise<void>((res) => (this.devicesWaiter = res));
         void this.runStream();
         if (this.opts.meta !== false) void this.runMetaStream();
         await Promise.race([devicesDone, new Promise<void>((res) => setTimeout(res, this.opts.readyTimeout ?? 30000))]);
         this.setStatus('ready');
+    }
+
+    /** The interfaces this system runs, typed: GET /api/rpc/v1/interfaces (needs rpc:read). */
+    listInterfaces(): Promise<InterfaceInfo[]> {
+        return this.request<InterfaceInfo[]>('GET', '/api/rpc/v1/interfaces').then((l) => (Array.isArray(l) ? l.map((i) => ({...i, running: i.running !== false})) : []));
+    }
+
+    /** The interfaces to follow: the system's list narrowed to opts.interfaces. A credential
+     *  without rpc:read (403) or a system without the route (404) is no failure: the consumer's
+     *  list stands as a guess, and the stream's hello names the rest. */
+    private async loadInterfaces(): Promise<void> {
+        const wanted = this.opts.interfaces;
+        try {
+            const list = await this.listInterfaces();
+            this.interfaces = wanted ? list.filter((i) => wanted.includes(i.name)) : list;
+            this.interfacesListed = true;
+        } catch (e) {
+            const code = (e as OccuLiteError).code;
+            if (code !== 'forbidden' && code !== 'not-found' && code !== 'unsupported') throw e;
+            this.opts.log?.warn?.(`occulite-client: the interfaces list is not available (${code}); following ${wanted?.join(', ') || 'what the stream names'}`);
+            this.interfaces = (wanted ?? []).map((name) => ({name, running: true}));
+            this.interfacesListed = false;
+        }
+    }
+
+    /** The names followed (the stream's interface= filter). */
+    private interfaceNames(): string[] {
+        return this.interfaces.map((i) => i.name);
+    }
+
+    private setInterfaceState(name: string, running: boolean): void {
+        const cur = this.interfaces.find((i) => i.name === name);
+        if (cur) cur.running = running;
+        else if (!this.opts.interfaces || this.opts.interfaces.includes(name)) this.interfaces.push({name, running});
     }
 
     /** Closes the streams; the client is done. */
@@ -237,7 +284,7 @@ export class OccuLite {
         let eventId = '';
         for (let page = 0; page < 1000; page++) {
             const q = new URLSearchParams({limit: '5000'});
-            for (const i of this.interfaces) q.append('interface', i);
+            for (const i of this.interfaceNames()) q.append('interface', i);
             if (after) q.set('after', after);
             const r = await this.request<{entries: any[]; next?: string; event_id?: string}>('GET', `/api/rpc/v1/state?${q}`);
             if (page === 0) eventId = r.event_id ?? '';
@@ -262,7 +309,7 @@ export class OccuLite {
         let firstDevices = this.opts.devices !== false;
         while (!this.abort.signal.aborted) {
             const q = new URLSearchParams();
-            for (const i of this.interfaces) q.append('interface', i);
+            for (const i of this.interfaceNames()) q.append('interface', i);
             if (firstDevices) q.set('devices', '1');
             const h = this.headers();
             if (this.lastEventId) h['Last-Event-ID'] = this.lastEventId;
@@ -311,6 +358,12 @@ export class OccuLite {
             case 'hello': {
                 if (this.bootId && d.boot_id && d.boot_id !== this.bootId) void this.resync('boot');
                 this.bootId = d.boot_id ?? this.bootId;
+                // the hello names the interfaces and their state: what a guess lacked, and the state of the listed ones
+                for (const i of Array.isArray(d.interfaces) ? d.interfaces : []) {
+                    if (typeof i?.name !== 'string') continue;
+                    if (this.interfacesListed && !this.interfaces.some((x) => x.name === i.name)) continue;
+                    this.setInterfaceState(i.name, i.state !== 'down');
+                }
                 if (this.status === 'degraded') this.setStatus('ready');
                 break;
             }
@@ -329,6 +382,10 @@ export class OccuLite {
                 break;
             }
             case 'interface':
+                if (typeof d.interface === 'string') {
+                    if (d.state === 'removed') this.interfaces = this.interfaces.filter((i) => i.name !== d.interface);
+                    else this.setInterfaceState(d.interface, d.state !== 'down');
+                }
                 this.emit('interface', {interface: d.interface, state: d.state});
                 break;
             case 'newDevices':
@@ -340,7 +397,7 @@ export class OccuLite {
                 if (Array.isArray(d.devices)) {
                     for (const desc of d.devices) if (desc?.ADDRESS) this.devices.set(mkRef(d.interface, desc.ADDRESS), desc);
                     this.devicesSeen.add(d.interface);
-                    if (this.devicesWaiter && this.interfaces.every((i) => this.devicesSeen.has(i))) {
+                    if (this.devicesWaiter && this.interfaces.every((i) => this.devicesSeen.has(i.name))) {
                         this.devicesWaiter();
                         this.devicesWaiter = undefined;
                     }

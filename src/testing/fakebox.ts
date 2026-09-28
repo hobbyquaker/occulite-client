@@ -22,7 +22,10 @@ export interface FakeBoxOptions {
      *  state-changing call on the cookie alone must carry X-Occulite-Request (403 request-header) */
     session?: string;
     scopes?: string[];
-    interfaces?: string[];
+    /** the interfaces the system runs, a name or {name, running} (default HmIP-RF, running) */
+    interfaces?: (string | {name: string; running?: boolean})[];
+    /** false: an older system without GET /api/rpc/v1/interfaces (404) */
+    interfacesRoute?: boolean;
     /** device descriptions per interface (listDevices) */
     devices?: Record<string, Record<string, unknown>[]>;
     /** VALUES paramset descriptions by `<interface>.<channel>` */
@@ -73,7 +76,17 @@ export class FakeBox {
     }
 
     private ifaces(): string[] {
-        return this.opts.interfaces ?? ['HmIP-RF'];
+        return this.ifaceList().map((i) => i.name);
+    }
+
+    private ifaceList(): {name: string; running: boolean}[] {
+        return (this.opts.interfaces ?? ['HmIP-RF']).map((i) => (typeof i === 'string' ? {name: i, running: true} : {name: i.name, running: i.running !== false})).sort((a, b) => (a.name < b.name ? -1 : 1));
+    }
+
+    /** The scopes the credential has; every lite-rpc route needs rpc:read (as on the system). */
+    private lacks(scope: string): boolean {
+        const have = this.opts.scopes ?? ['*'];
+        return !have.includes('*') && !have.includes(scope);
     }
 
     private json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -205,7 +218,11 @@ export class FakeBox {
             this.opts.token = `olt_${randomBytes(16).toString('hex')}`;
             return this.json(res, 200, {token: this.opts.token, name: 'fake', previous_valid_s: 60});
         }
-        if (key === 'GET /api/rpc/v1/interfaces') return this.json(res, 200, this.ifaces().map((name) => ({name, protocol: 'xmlrpc', url_path: `/api/rpc/v1/xmlrpc/${name}`, running: true})));
+        if (path.startsWith('/api/rpc/v1/') && this.lacks('rpc:read')) return this.json(res, 403, {error: 'forbidden', scope: 'rpc:read', message: 'the credential lacks rpc:read'});
+        if (key === 'GET /api/rpc/v1/interfaces') {
+            if (this.opts.interfacesRoute === false) return this.json(res, 404, {error: 'not_found', message: 'no route'});
+            return this.json(res, 200, this.ifaceList().map((i) => ({name: i.name, protocol: 'xmlrpc', url_path: `/api/rpc/v1/xmlrpc/${i.name}`, running: i.running})));
+        }
         if (key === 'GET /api/rpc/v1/state') {
             const want = u.searchParams.getAll('interface');
             const entries = Object.entries(this.opts.values ?? {})
@@ -231,7 +248,7 @@ export class FakeBox {
             res.writeHead(200, {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store'});
             res.write(': connected\n\n');
             const s: Stream = {res, interfaces: u.searchParams.getAll('interface')};
-            this.send(res, `${this.bootId}-${this.seq}`, 'hello', {boot_id: this.bootId, seq: this.seq, interfaces: this.ifaces().map((name) => ({name, state: 'up'}))});
+            this.send(res, `${this.bootId}-${this.seq}`, 'hello', {boot_id: this.bootId, seq: this.seq, interfaces: this.ifaceList().map((i) => ({name: i.name, state: i.running ? 'up' : 'down'})), buffer: {seconds: 300, events: 5000}});
             const last = req.headers['last-event-id'];
             if (typeof last === 'string' && last) {
                 const [boot, n] = [last.slice(0, last.lastIndexOf('-')), Number(last.slice(last.lastIndexOf('-') + 1))];

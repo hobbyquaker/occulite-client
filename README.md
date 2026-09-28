@@ -50,10 +50,13 @@ const box = new OccuLite({
 box.on('status', s => console.log(s.state))     // connecting | ready | degraded | offline | closed
 await box.ready()
 
+box.interfaces                                      // [{name, protocol, url_path, running}] - live
+await box.listInterfaces()                          // the same from GET /api/rpc/v1/interfaces (needs rpc:read)
 box.values.get('HmIP-RF.000A1B2C3D4E5F:1.STATE')    // {value, ts, lc, confirmed}
 box.on('value', ev => {})                           // {ref, interface, address, key, value, ts, lc, confirmed, batch?}
 box.on('batch', events => {})                       // one system.multicall's events together
 box.on('resync', ({reason}) => {})                  // after a gap or another boot: republish if you cache
+box.on('interface', ({interface, state}) => {})     // up | down | restarted | added | removed
 
 await box.setValue('HmIP-RF.000A1B2C3D4E5F:4.LEVEL', 1)   // a FLOAT goes as a double
 await box.call('BidCos-RF', 'getLinks', ['JEQ0230153:1', 0])
@@ -63,6 +66,11 @@ await box.history('HmIP-RF.000A1B2C3D4E5F:1.ACTUAL_TEMPERATURE', {maxPoints: 288
 ```
 
 In a browser on the system itself, `auth: {session}` with the page's session, and the default `fetch` transport.
+
+The interfaces the client follows come from `GET /api/rpc/v1/interfaces` - the names `InterfacesList.xml` has, as
+lite-rpc's paths take them - narrowed to `interfaces: [...]` when you pass one. The list stays behind `rpc:read` (it
+tells the radio hardware): a credential without it, or an older system without the route, is no failure - your
+`interfaces` option stands, and the stream's `hello` names the rest. `running` follows the `interface` events.
 
 ### Authentication
 

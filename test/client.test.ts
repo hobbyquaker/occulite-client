@@ -52,7 +52,8 @@ test('connect, the complete picture, live values, batches, requests', async (t) 
     assert.equal(c.status, 'ready');
     assert.equal(c.info.implementation, 'fakebox');
     assert.equal(c.capabilities.state, true);
-    assert.deepEqual(c.interfaces, ['HmIP-RF', 'BidCos-RF']);
+    assert.deepEqual(c.interfaces.map((i) => i.name), ['BidCos-RF', 'HmIP-RF']);
+    assert.deepEqual(await c.listInterfaces(), [{name: 'BidCos-RF', protocol: 'xmlrpc', url_path: '/api/rpc/v1/xmlrpc/BidCos-RF', running: true}, {name: 'HmIP-RF', protocol: 'xmlrpc', url_path: '/api/rpc/v1/xmlrpc/HmIP-RF', running: true}]);
     const lv = c.values.get('HmIP-RF.000A1B2C3D4E5F:4.LEVEL')!;
     assert.equal(lv.value, 0.5);
     assert.equal(lv.confirmed, false);
@@ -186,4 +187,48 @@ test('X-Occulite-Request on every request: a cookie-only write passes, one witho
     // a Bearer needs none
     const bearer = await fetch(`${cookieBox.url}/api/meta/v1/objects/x`, {method: 'PATCH', headers: {Authorization: `Bearer ${sid}`, 'Content-Type': 'application/json'}, body: '{}'});
     assert.equal(bearer.status, 200);
+});
+
+test('interfaces: the typed list, running kept live, a token without rpc:read and an older system fall back', async (t) => {
+    // the list, narrowed to the consumer's choice; a down interface is in it with running: false
+    const b = new FakeBox({interfaces: ['HmIP-RF', {name: 'BidCos-Wired', running: false}, 'BidCos-RF'], devices: {'HmIP-RF': [{ADDRESS: 'A'}], 'BidCos-RF': []}});
+    await b.start();
+    t.after(() => b.stop());
+    const c = new OccuLite({url: b.url, interfaces: ['HmIP-RF', 'BidCos-Wired'], values: false, meta: false, readyTimeout: 500, reconnect: {min: 20, max: 50}});
+    t.after(() => c.close());
+    await c.ready();
+    assert.deepEqual(c.interfaces, [{name: 'BidCos-Wired', protocol: 'xmlrpc', url_path: '/api/rpc/v1/xmlrpc/BidCos-Wired', running: false}, {name: 'HmIP-RF', protocol: 'xmlrpc', url_path: '/api/rpc/v1/xmlrpc/HmIP-RF', running: true}]);
+    const states: unknown[] = [];
+    c.on('interface', (e: unknown) => states.push(e));
+    b.push('interface', {interface: 'BidCos-Wired', state: 'up'});
+    await until(() => states.length === 1);
+    assert.equal(c.interfaces.find((i) => i.name === 'BidCos-Wired')?.running, true);
+    c.close();
+
+    // a token without rpc:read: listInterfaces() names the scope, ready() does not fail at that step
+    const ro = new FakeBox({token: 'olt_ro', scopes: ['meta:read']});
+    await ro.start();
+    t.after(() => ro.stop());
+    const n = new OccuLite({url: ro.url, auth: {token: 'olt_ro'}, values: false, devices: false, readyTimeout: 500});
+    t.after(() => n.close());
+    await assert.rejects(n.listInterfaces(), (e: OccuLiteError) => e.code === 'forbidden' && e.scope === 'rpc:read');
+    await n.ready();
+    assert.deepEqual(n.interfaces, []);
+    n.close();
+
+    // an older system without the route: the stream's hello names the interfaces and their state
+    const old = new FakeBox({interfacesRoute: false, interfaces: ['HmIP-RF', {name: 'BidCos-RF', running: false}], devices: {'HmIP-RF': [], 'BidCos-RF': []}});
+    await old.start();
+    t.after(() => old.stop());
+    const o = new OccuLite({url: old.url, values: false, meta: false, readyTimeout: 500});
+    t.after(() => o.close());
+    await o.ready();
+    assert.deepEqual(o.interfaces, [{name: 'BidCos-RF', running: false}, {name: 'HmIP-RF', running: true}]);
+    o.close();
+    // ... and one the consumer did not ask for is not adopted from the hello
+    const o2 = new OccuLite({url: old.url, interfaces: ['HmIP-RF'], values: false, meta: false, readyTimeout: 500});
+    t.after(() => o2.close());
+    await o2.ready();
+    assert.deepEqual(o2.interfaces, [{name: 'HmIP-RF', running: true}]);
+    o2.close();
 });
