@@ -128,6 +128,40 @@ from its cache); rfd asks a BidCos actuator for its status on every `getParamset
 channel once and never as a poll, and leaves out a BidCos device whose `UNREACH` is set. The stream keeps everything
 current afterwards.
 
+### The system API's slice
+
+`box.system` is the thin, typed part of the system API the consumers use; everything else is `box.request()`. Every
+method rejects `unsupported` when the connected system offers no system API, and `forbidden` naming `system:read` or
+`system:write` when the token lacks it (pair with `system: 'read'` or `'configure'`).
+
+```js
+await box.system.status()             // StatusInfo: hostname, versions, uptime, load, memory, disks, timezone, hm_mode
+await box.system.radioHealth()        // RadioHealth: every radio's duty_cycle and carrier_sense, sampled once a minute, with history
+await box.system.serviceMessages()    // ServiceMessageView: {count, messages: [{interface, address, key, value, since, seen, name, enums}], swept, errors}
+box.on('serviceMessages', view => {}) // the same view whenever the active set changes (a stream, opened with the first handler)
+await box.system.groups.list()        // {groups: [{id, name, type, type_label, device, ref}], devices_to_configure}
+await box.system.groups.types()       // [{id, label, assignable: [{id, serial, type}], leftover}]
+await box.system.groups.get(id)       // HeatingGroupDetail: members, assignable, leftover, forbid_single_operation, device_name
+await box.system.groups.create({name, type, members, forbid_single_operation})
+await box.system.groups.update(id, {name, members, forbid_single_operation})   // the members as a whole
+await box.system.groups.remove(id)    // {deleted, former_members}
+await box.system.datastore.history()                              // HistoryList: what the system records
+await box.system.datastore.history({add: ['POWER'], remove: []})  // for a program that wants more datapoints drawn
+```
+
+The **service messages** are what a CCU's alarm list showed - the maintenance datapoints active on channel 0
+(`UNREACH`, `LOWBAT`, `CONFIG_PENDING`, `SABOTAGE`, the `ERROR_*` codes), each with `since` and whether the system
+watched it start (`seen: 'event'`) or found it active at a sweep (`'start'`: at least since), and the device's name
+and rooms from the metadata. The stream `GET /api/system/v1/service-messages/stream` is one more of the token's
+streams (two per token; a connection uses one for the events and one for the metadata already, so a second instance
+with the same token gets `too-many-streams`): the client opens it with the first `serviceMessages` handler, closes it
+with the last, and reopens it like the others. **The heating groups** are hmipserver's group devices (`INT000000N`
+on `VirtualDevices`): a member id is the device address, a group's writes wait up to 45 s (`GROUPS_TIMEOUT`), and the
+errors are the API's - `unknown-group`, `invalid` (the field named), `hmipserver` (502: it refused or did not
+answer; a failed save is undone by the system), `unsupported` (501: a system without hmipserver). **The radio
+health** replaces polling `listBidcosInterfaces` for a duty cycle: the system samples once a minute and keeps the
+last 500 samples per radio (`history`).
+
 ### The metadata
 
 `box.meta` is a live copy of the system's names and taxonomy (rooms, functions and any other enum - trees, not

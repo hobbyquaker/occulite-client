@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **The system API's slice, `box.system`** (typed, thin): `status()`, `radioHealth()`, `serviceMessages()`,
+  `groups.list/types/get/create/update/remove` (a write waits `GROUPS_TIMEOUT`, 45 s; a DELETE carries `{}`),
+  `datastore.history()` and `datastore.history({add, remove})`; every method rejects `unsupported` without a request
+  when the system's capabilities name no system API, and `forbidden` naming `system:read`/`system:write` as the API
+  does. The **`serviceMessages` event** carries the view from `GET /api/system/v1/service-messages/stream`, a stream
+  opened with the first handler and closed with the last (the token's stream limit), reopened with the backoff; a
+  refused credential or a system without the route ends it with one `error` event. The types `StatusInfo`,
+  `RadioHealth`, `RadioInterfaceHealth`, `RadioSample`, `RpcFeed`, `HeatingGroup`, `HeatingGroupDetail`,
+  `HeatingGroupType`, `GroupMember`, `HistoryList` are exported. `FakeBox` serves the routes with fixtures and an
+  in-memory group store (`status`, `radioHealth`, `serviceMessages` with `setServiceMessages()`, `groups`,
+  `groupTypes`, `systemApi: false` for a system without the API, `systemRequests`, `serviceStreamsOpened`).
+
 - **Types:** `DeviceDescription` (the `listDevices` entry), `ParamsetDescription`/`ParamDescription`,
   `ParamValue`, `SpecialValue`, `ServiceMessage`/`ServiceMessageView` exported from the root; `box.devices` is
   `Map<string, DeviceDescription>`, `paramsetDescription()` answers a `ParamsetDescription`. `Info` gained `format` and a

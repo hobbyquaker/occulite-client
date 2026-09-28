@@ -10,8 +10,9 @@ import {OccuLiteError, abortError, httpError, timeoutSignal} from './errors.ts';
 import {MetaCopy, type MetaDocument, type MetaEvent, type WriteOptions, type WriteResult} from './meta.ts';
 import {datapointRef, deviceOf, parseDatapointRef, parseRef, ref as mkRef} from './refs.ts';
 import {parseSSE} from './sse.ts';
+import {SystemAPI} from './system.ts';
 import {fetchTransport, type Transport} from './transport.ts';
-import type {DeviceDescription, ParamsetDescription} from './types.ts';
+import type {DeviceDescription, ParamsetDescription, ServiceMessageView} from './types.ts';
 
 /** The API majors this client speaks. */
 export const SPEAKS = {meta: 1, rpc: 1, system: 1, auth: 1};
@@ -182,6 +183,8 @@ export class OccuLite {
     /** device and channel descriptions by ref, as listDevices gives them */
     readonly devices = new Map<string, DeviceDescription>();
     readonly meta = new MetaCopy();
+    /** the system API's slice: status, radio health, service messages, the heating groups, the history list */
+    readonly system: SystemAPI;
     status: Status = 'idle';
     /** requests in flight, for a consumer that paces its writes */
     inflight = 0;
@@ -208,6 +211,8 @@ export class OccuLite {
     private sweeping: Promise<SweepResult> | undefined;
     /** the list came from the interfaces route (else it is a guess the stream's hello completes) */
     private interfacesListed = false;
+    /** the service-message stream, open while a `serviceMessages` handler is registered */
+    private serviceStream: AbortController | undefined;
 
     constructor(opts: Options) {
         this.opts = opts;
@@ -218,6 +223,14 @@ export class OccuLite {
         this.meta.attach({
             write: (method, path, body, o) => this.metaWrite(method, path, body, o),
             read: (path, o) => this.metaRead(path, o),
+        });
+        const self = this;
+        this.system = new SystemAPI({
+            request: (method, path, body, o) => this.request(method, path, body, o),
+            get capabilities() {
+                return self.capabilities;
+            },
+            unsupportedError: (what) => new OccuLiteError('unsupported', what),
         });
     }
 
@@ -285,12 +298,18 @@ export class OccuLite {
 
     // ---- events ------------------------------------------------------------------------------
 
-    /** Subscribes; the answer unsubscribes. Events: status, value, batch, devices, interface, meta, resync, error. */
+    /** Subscribes; the answer unsubscribes. Events: status, value, batch, devices, interface, meta,
+     *  sweep, resync, error - and serviceMessages, whose stream (GET /api/system/v1/service-messages/stream,
+     *  one more of the token's streams) is opened with the first handler and closed with the last. */
     on(event: string, fn: Handler): () => void {
         let s = this.handlers.get(event);
         if (!s) this.handlers.set(event, (s = new Set()));
         s.add(fn);
-        return () => s!.delete(fn);
+        if (event === 'serviceMessages' && s.size === 1) this.startServiceStream();
+        return () => {
+            s!.delete(fn);
+            if (event === 'serviceMessages' && s!.size === 0) this.stopServiceStream();
+        };
     }
 
     private emit(event: string, arg: unknown): void {
@@ -498,6 +517,7 @@ export class OccuLite {
     /** Closes the streams; the client is done. */
     close(): void {
         this.abort.abort();
+        this.serviceStream = undefined;
         clearTimeout(this.batchTimer);
         clearTimeout(this.metaRefresh);
         this.setStatus('closed');
@@ -534,9 +554,9 @@ export class OccuLite {
 
     /** Opens a stream with a silence watchdog: no message or ping for streamTimeout ends it, and
      *  the caller reopens. The stream ends with close() too. */
-    private async openStream(url: string, headers: Record<string, string>): Promise<{status: number; body?: string; messages: AsyncGenerator<import('./sse.ts').SSEMessage>}> {
+    private async openStream(url: string, headers: Record<string, string>, extra?: AbortSignal): Promise<{status: number; body?: string; messages: AsyncGenerator<import('./sse.ts').SSEMessage>}> {
         const sc = new AbortController();
-        const signal = AbortSignal.any([this.abort.signal, sc.signal]);
+        const signal = AbortSignal.any(extra ? [this.abort.signal, sc.signal, extra] : [this.abort.signal, sc.signal]);
         const silence = this.opts.streamTimeout ?? 45000;
         let timer: ReturnType<typeof setTimeout> | undefined;
         const kick = () => {
@@ -827,6 +847,69 @@ export class OccuLite {
                 this.opts.log?.warn?.(`occulite-client: the metadata stream ended: ${(e as Error).message}`);
             }
             await new Promise((res) => setTimeout(res, delay));
+            delay = Math.min(delay * 2, this.opts.reconnect?.max ?? 30000);
+        }
+    }
+
+    // ---- the service-message stream (task 9) -----------------------------------------------------
+
+    private startServiceStream(): void {
+        if (this.serviceStream || this.abort.signal.aborted) return;
+        const ac = new AbortController();
+        this.serviceStream = ac;
+        void this.runServiceStream(ac);
+    }
+
+    private stopServiceStream(): void {
+        this.serviceStream?.abort();
+        this.serviceStream = undefined;
+    }
+
+    /** GET /api/system/v1/service-messages/stream: `event: messages` with the whole view at once and
+     *  again whenever the active set changes (`: ping` every 30 s). Reopened with the backoff like
+     *  the others; a refused credential (401/403), a system without the route or the store (404/501)
+     *  ends it with one `error` event - a retry would not get better. */
+    private async runServiceStream(ac: AbortController): Promise<void> {
+        let delay = this.opts.reconnect?.min ?? 1000;
+        while (!this.abort.signal.aborted && !ac.signal.aborted) {
+            try {
+                const s = await this.openStream(`${this.url}/api/system/v1/service-messages/stream`, this.headers(), ac.signal);
+                if (s.status !== 200) {
+                    let body: unknown = s.body;
+                    try {
+                        body = JSON.parse(s.body ?? '');
+                    } catch {
+                        /* text */
+                    }
+                    if (s.status === 401 && (await this.resolveAuth('unauthenticated'))) continue;
+                    const err = httpError(s.status, body);
+                    if (s.status === 401 || s.status === 403 || s.status === 404 || s.status === 501) {
+                        this.emit('error', err);
+                        this.opts.log?.warn?.(`occulite-client: no service-message stream (${err.code}); serviceMessages handlers get nothing`);
+                        return;
+                    }
+                    throw err;
+                }
+                delay = this.opts.reconnect?.min ?? 1000;
+                for await (const m of s.messages) {
+                    if (m.event !== 'messages') continue;
+                    let view: ServiceMessageView;
+                    try {
+                        view = JSON.parse(m.data);
+                    } catch {
+                        continue;
+                    }
+                    this.emit('serviceMessages', view);
+                }
+            } catch (e) {
+                if (this.abort.signal.aborted || ac.signal.aborted) return;
+                this.opts.log?.warn?.(`occulite-client: the service-message stream ended: ${(e as Error).message}`);
+            }
+            if (this.abort.signal.aborted || ac.signal.aborted) return;
+            await new Promise((res) => {
+                const t = setTimeout(res, delay);
+                ac.signal.addEventListener('abort', () => (clearTimeout(t), res(undefined)), {once: true});
+            });
             delay = Math.min(delay * 2, this.opts.reconnect?.max ?? 30000);
         }
     }

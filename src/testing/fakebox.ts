@@ -1,8 +1,9 @@
 // occulite-client/testing: a fake openccu-lite system in one Node http server - the version answer
 // with its capabilities, the auth state, lite-rpc's interfaces, JSON-RPC path and event stream
 // (hello, device lists, events with batch marks, resync), the state store, the history, the
-// metadata snapshot and its change stream, pairing and token rotation. The package's own tests run
-// against it; a consumer's tests can too (the porting guide's testing section).
+// metadata snapshot and its change stream, pairing and token rotation, and the system API's slice
+// (status, radio health, service messages with their stream, the heating groups, the history list).
+// The package's own tests run against it; a consumer's tests can too (the porting guide's testing section).
 
 import {createHash, randomBytes} from 'node:crypto';
 import http from 'node:http';
@@ -49,6 +50,21 @@ export interface FakeBoxOptions {
     hang?: boolean;
     /** send the stream's `: ping` comment every n ms (default: none; the system does every 15 s) */
     pingInterval?: number;
+    /** false: a system without the system API (its capabilities name none; the routes 404) */
+    systemApi?: boolean;
+    /** `GET /api/system/v1/status`; a small default */
+    status?: Record<string, unknown>;
+    /** `GET /api/system/v1/radio/health`; a default with one HmIP-RF entry */
+    radioHealth?: Record<string, unknown>;
+    /** the active service messages (`GET /service-messages` and its stream); setServiceMessages() changes them */
+    serviceMessages?: Record<string, unknown>[];
+    /** the heating groups, in the shape of `GET /groups/{id}` (id, name, type, members, forbid_single_operation) */
+    groups?: {id: number; name: string; type: string; members: {id: string; serial: string; type: string}[]; forbid_single_operation?: boolean}[];
+    /** the group types with their assignable devices; default one BidCos type with two thermostats */
+    groupTypes?: {id: string; label: string; assignable: {id: string; serial: string; type: string}[]; leftover: {id: string; serial: string; type: string}[]}[];
+    /** the history list's additions and removals (`/datastore/history`) */
+    historyAdd?: string[];
+    historyRemove?: string[];
 }
 
 interface Stream {
@@ -72,6 +88,11 @@ export class FakeBox {
     streamsOpened = 0;
     /** the same for the metadata change stream */
     metaStreamsOpened = 0;
+    /** and for the service-message stream */
+    serviceStreamsOpened = 0;
+    /** every request below /api/system/v1: `METHOD /path` */
+    readonly systemRequests: string[] = [];
+    private serviceStreams = new Set<http.ServerResponse>();
     private held = new Set<{req: http.IncomingMessage; res: http.ServerResponse}>();
     readonly pairings = new Map<string, {poll: string; nonce: Buffer; commit: string; clientNonce?: Buffer; state: string; token?: string; access: unknown; app: string}>();
 
@@ -108,6 +129,7 @@ export class FakeBox {
         this.held.clear();
         for (const s of this.streams) s.res.end();
         for (const r of this.metaStreams) r.end();
+        for (const r of this.serviceStreams) r.end();
         this.server.closeAllConnections();
         await new Promise<void>((res) => this.server.close(() => res()));
     }
@@ -190,6 +212,22 @@ export class FakeBox {
         this.push('interface', {interface: name, state: running ? 'up' : 'down'});
     }
 
+    /** The service messages change: the new list, and the view on every open stream. */
+    setServiceMessages(list: Record<string, unknown>[]): void {
+        this.opts.serviceMessages = list;
+        for (const r of this.serviceStreams) r.write(`event: messages\ndata: ${JSON.stringify(this.serviceView())}\n\n`);
+    }
+
+    /** How many service-message streams are open now. */
+    get serviceStreamsOpen(): number {
+        return this.serviceStreams.size;
+    }
+
+    private serviceView(): Record<string, unknown> {
+        const messages = this.opts.serviceMessages ?? [];
+        return {count: messages.length, messages, swept: '2026-09-25T00:00:00Z', errors: {}};
+    }
+
     /** A metadata change event. */
     metaEvent(ev: Record<string, unknown>): void {
         for (const r of this.metaStreams) r.write(`data: ${JSON.stringify(ev)}\n\n`);
@@ -227,7 +265,8 @@ export class FakeBox {
         const path = u.pathname;
         const key = `${req.method} ${path}`;
         if (key === 'GET /api/meta/v1/version') {
-            return this.json(res, 200, {api: 'meta', version: 1, format: 1, revision: this.opts.meta?.revision ?? 0, implementation: 'fakebox', capabilities: this.opts.capabilities ?? {pairing: true, state: true, history: true, apis: {meta: 1, rpc: 1, system: 1, auth: 1}, transports: ['sse'], json_double: true}});
+            const apis: Record<string, number> = {meta: 1, rpc: 1, auth: 1, ...(this.opts.systemApi === false ? {} : {system: 1})};
+            return this.json(res, 200, {api: 'meta', version: 1, format: 1, revision: this.opts.meta?.revision ?? 0, implementation: 'fakebox', capabilities: this.opts.capabilities ?? {pairing: true, state: true, history: true, apis, transports: ['sse'], json_double: true}});
         }
         // pairing: open, the poll secret is the credential
         if (key === 'POST /api/auth/v1/pairing/request') {
@@ -402,6 +441,94 @@ export class FakeBox {
             if (path.startsWith('/api/meta/v1/enums/') && req.method === 'DELETE' && !u.searchParams.has('members') && this.opts.metaMembers?.length) return this.json(res, 409, {error: 'has-members', message: 'members', detail: {refs: this.opts.metaMembers}});
             meta.revision++;
             return this.json(res, req.method === 'POST' && (path.endsWith('/enums') || path.endsWith('/nodes')) ? 201 : 200, {revision: meta.revision, changed: true});
+        }
+        if (path.startsWith('/api/system/v1/')) return this.handleSystem(req, res, u);
+        this.json(res, 404, {error: 'not_found', message: `no route ${key}`});
+    }
+
+    // ---- the system API's slice (task 9): the shapes of docs/system-api.md, the scopes as the system checks them ----
+
+    private async handleSystem(req: http.IncomingMessage, res: http.ServerResponse, u: URL): Promise<void> {
+        const rel = u.pathname.slice('/api/system/v1'.length);
+        const key = `${req.method} ${rel}`;
+        this.systemRequests.push(key);
+        if (this.opts.systemApi === false) return this.json(res, 404, {error: 'not_found', message: `no route ${key}`});
+        const safe = req.method === 'GET' || req.method === 'HEAD';
+        if (this.lacks(safe ? 'system:read' : 'system:write')) return this.json(res, 403, {error: 'forbidden', scope: safe ? 'system:read' : 'system:write', message: `the credential lacks ${safe ? 'system:read' : 'system:write'}`});
+        if (key === 'GET /status') return this.json(res, 200, this.opts.status ?? {hostname: 'fakebox', version: {version: '3.89.11.20260919', product: 'fake', platform: 'fake', lite: '1.0.0-dev.0'}, occulited_version: 'fakebox', uptime_s: 42, load: [0.1, 0.2, 0.3], mem_total_kb: 1024, mem_available_kb: 512, disks: [{mount: '/', total_kb: 1000, used_kb: 500}], time: new Date().toISOString(), timezone: 'Europe/Berlin', hm_mode: 'HMIP'});
+        if (key === 'GET /radio/health') return this.json(res, 200, this.opts.radioHealth ?? {polled: new Date().toISOString(), interfaces: [{interface: 'HmIP-RF', address: '3014F711A0000000000000FA', type: 'RPI-RF-MOD', connected: true, default: true, firmware: '4.4.22', duty_cycle: 3, carrier_sense: 12, carrier_sense_source: 'event'}], answering: [], errors: {}, history: {'HmIP-RF/3014F711A0000000000000FA': [{t: '2026-09-25T00:00:00Z', dc: 2, cs: 10, up: true}, {t: '2026-09-25T00:01:00Z', dc: 3, cs: 12, up: true}]}, busy: false, busy_interface: ''});
+        if (key === 'GET /service-messages') return this.json(res, 200, this.serviceView());
+        if (key === 'GET /service-messages/stream') {
+            this.serviceStreamsOpened++;
+            res.writeHead(200, {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store'});
+            res.write(`event: messages\ndata: ${JSON.stringify(this.serviceView())}\n\n`);
+            if (this.opts.pingInterval) {
+                const t = setInterval(() => res.write(': ping\n\n'), this.opts.pingInterval);
+                req.on('close', () => clearInterval(t));
+            }
+            this.serviceStreams.add(res);
+            req.on('close', () => this.serviceStreams.delete(res));
+            return;
+        }
+        if (key === 'GET /datastore/history' || key === 'PUT /datastore/history') {
+            if (req.method === 'PUT') {
+                const b = (await this.body(req)) ?? {};
+                const bad = [...(b.add ?? []), ...(b.remove ?? [])].find((n: string) => !/^[A-Z0-9_]+$/.test(n));
+                if (bad) return this.json(res, 422, {error: 'invalid', message: `not a datapoint name: ${bad}`});
+                this.opts.historyAdd = b.add ?? [];
+                this.opts.historyRemove = b.remove ?? [];
+            }
+            const defaults = ['ACTUAL_TEMPERATURE', 'HUMIDITY', 'LEVEL', 'STATE'];
+            const datapoints: Record<string, string> = {};
+            for (const n of [...defaults, ...(this.opts.historyAdd ?? [])]) if (!(this.opts.historyRemove ?? []).includes(n)) datapoints[n] = /TEMPERATURE|HUMIDITY|LEVEL|POWER/.test(n) ? 'sampled' : 'event';
+            return this.json(res, 200, {datapoints, defaults, add: this.opts.historyAdd ?? [], remove: this.opts.historyRemove ?? [], series: 3, capped: 0, rows_per_series: 500, max_series: 1000});
+        }
+        // the heating groups: an in-memory store in the API's shapes; a member id fits one group at a time
+        type M = {id: string; serial: string; type: string};
+        const types = () => this.opts.groupTypes ?? [{id: 'HomeMatic.heating', label: 'Heating_Control', assignable: [{id: 'KEQ0000001', serial: 'KEQ0000001', type: 'HM-CC-RT-DN'}, {id: 'KEQ0000002', serial: 'KEQ0000002', type: 'HM-TC-IT-WM-W-EU'}], leftover: []}];
+        const groups = (this.opts.groups ??= []);
+        const member = (id: string) => types().flatMap((t) => [...t.assignable, ...t.leftover]).find((m) => m.id === id) ?? {id, serial: id, type: 'unknown'};
+        const serial = (id: number) => `INT${String(id).padStart(7, '0')}`;
+        const taken = (except?: number) => new Set(groups.filter((g) => g.id !== except).flatMap((g) => g.members.map((m) => m.id)));
+        const detail = (g: (typeof groups)[0], configure?: string[]) => {
+            const t = types().find((x) => x.id === g.type);
+            const used = taken(g.id);
+            return {id: g.id, name: g.name, type: g.type, device: serial(g.id), ref: `VirtualDevices.${serial(g.id)}`, device_name: `${g.name} ${serial(g.id)}`, forbid_single_operation: g.forbid_single_operation ?? false, members: g.members, assignable: (t?.assignable ?? []).filter((m: M) => !used.has(m.id) && !g.members.some((x) => x.id === m.id)), leftover: t?.leftover ?? [], types: types().map((x) => ({id: x.id, label: x.label})), ...(configure ? {devices_to_configure: configure.map(member)} : {})};
+        };
+        if (key === 'GET /groups') return this.json(res, 200, {groups: groups.map((g) => ({id: g.id, name: g.name, type: g.type, type_label: types().find((t) => t.id === g.type)?.label ?? g.type, device: serial(g.id), ref: `VirtualDevices.${serial(g.id)}`})), devices_to_configure: []});
+        if (key === 'GET /groups/types') {
+            const used = taken();
+            return this.json(res, 200, {types: types().map((t) => ({...t, assignable: t.assignable.filter((m) => !used.has(m.id))}))});
+        }
+        const gm = /^\/groups\/(\d+)$/.exec(rel);
+        if (key === 'POST /groups' || (gm && (req.method === 'PUT' || req.method === 'DELETE'))) {
+            const b = (await this.body(req)) ?? {};
+            if (req.method === 'POST') {
+                if (typeof b.name !== 'string' || !b.name.trim() || b.name.length > 64) return this.json(res, 422, {error: 'invalid', message: 'name: 1 to 64 characters on one line'});
+                if (!types().some((t) => t.id === b.type)) return this.json(res, 422, {error: 'invalid', message: 'type: the group type, e.g. HomeMatic.heating'});
+                const id = (groups.at(-1)?.id ?? 0) + 1;
+                const g = {id, name: b.name.trim(), type: b.type, members: (b.members ?? []).map(member) as M[], forbid_single_operation: b.forbid_single_operation ?? false};
+                groups.push(g);
+                return this.json(res, 200, detail(g, g.members.map((m) => m.id)));
+            }
+            const g = groups.find((x) => x.id === Number(gm![1]));
+            if (!g) return this.json(res, 404, {error: 'unknown-group', message: `no group ${gm![1]}`});
+            if (req.method === 'DELETE') {
+                groups.splice(groups.indexOf(g), 1);
+                return this.json(res, 200, {deleted: g.id, former_members: g.members});
+            }
+            if (b.name !== undefined) {
+                if (typeof b.name !== 'string' || !b.name.trim()) return this.json(res, 422, {error: 'invalid', message: 'name: 1 to 64 characters on one line'});
+                g.name = b.name.trim();
+            }
+            if (Array.isArray(b.members)) g.members = b.members.map(member);
+            if (typeof b.forbid_single_operation === 'boolean') g.forbid_single_operation = b.forbid_single_operation;
+            return this.json(res, 200, detail(g, g.members.map((m) => m.id)));
+        }
+        if (gm && req.method === 'GET') {
+            const g = groups.find((x) => x.id === Number(gm[1]));
+            if (!g) return this.json(res, 404, {error: 'unknown-group', message: `no group ${gm[1]}`});
+            return this.json(res, 200, detail(g));
         }
         this.json(res, 404, {error: 'not_found', message: `no route ${key}`});
     }
