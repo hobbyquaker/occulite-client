@@ -3,7 +3,7 @@
 export {OccuLite, REQUEST_HEADER, SPEAKS, type Auth, type AuthProvider, type Capabilities, type Credential, type Mode, type Info, type InterfaceInfo, type Options, type Status, type SweepResult, type Value, type ValueEvent} from './client.ts';
 export {META_SNAPSHOT_KEY, descriptionKey, memoryCache, type DescriptionCache} from './cache.ts';
 export {OccuLiteError, type CertificateInfo} from './errors.ts';
-export {MetaCopy, type MetaDocument, type MetaEvent, type MetaObject, type NodeInfo} from './meta.ts';
+export {MetaCopy, type MetaDocument, type MetaEnum, type MetaErrorCode, type MetaEvent, type MetaNode, type MetaObject, type MetaWriter, type NodeInfo, type NodeRef, type WriteOptions, type WriteResult} from './meta.ts';
 export {datapointRef, deviceOf, parseDatapointRef, parseRef, ref} from './refs.ts';
 export {parseSSE, type SSEMessage} from './sse.ts';
 export {fetchTransport, type Transport, type TransportResponse} from './transport.ts';

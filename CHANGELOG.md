@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The metadata API complete on `box.meta`: `objects.patch/put/delete/bulk/rename/assign`,
+  `enums.create/update/delete/list`, `tree.create/update/delete`, `import(document, {mode})`, `export({format})` -
+  every write answers `{revision, changed}` (a `304` as `changed: false`), takes `{ifMatch}` (→ `revision-conflict`),
+  a DELETE carries `{}`; the API's error codes typed (`MetaErrorCode`). `membership(ref, {inherit = true, lang})`
+  answers the nodes (`{path, id, name, depth}`) most specific first, ancestors included; `membershipNames()` the
+  names, each once (what `membership()` answered in 0.1.0); `query(path, {orphaned})` is the format's subtree query;
+  `nodeAt()`, `hasPath()`. The copy applies `node.moved` (member paths rewritten), `node.updated` and `enum.updated`
+  in place. `box.rename()`/`box.assign()` answer `{revision, changed}` now. The tests run occulited's conformance
+  fixtures (vendored under `test/fixtures/meta/`, `OPENCCU_LITE_FIXTURES` for an upstream checkout) against the
+  copy's reads. `FakeBox` records every metadata write (`metaWrites`), checks `If-Match`, answers a `{}` PATCH with
+  `304`, refuses writes to a credential without `meta:write`, and has `metaMembers` for `has-members`.
+
 - `callbacks`: `initId` as a string or a function of the interface (beside `initIds`), the synthetic `interface`
   method with `interfaceEvents: true` (`[initId, iface, state]`), the argument lists documented; `updateDevice`'s
   hint stays `0` (the stream carries none); `listDevices` is never emitted.

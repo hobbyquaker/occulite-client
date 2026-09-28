@@ -43,7 +43,7 @@ export class OccuLiteError extends Error {
 
 /** The error of an API answer that is not 2xx: its {error, message} when it has one. */
 export function httpError(status: number, body: unknown): OccuLiteError {
-    const b = (body && typeof body === 'object' ? body : {}) as {error?: string; message?: string; scope?: string};
+    const b = (body && typeof body === 'object' ? body : {}) as {error?: string; message?: string; scope?: string; detail?: unknown};
     let code = b.error ?? (status === 401 ? 'unauthenticated' : status === 403 ? 'forbidden' : status === 404 ? 'not-found' : status === 501 ? 'unsupported' : `http-${status}`);
     let message = b.message ?? `HTTP ${status}`;
     let scope = b.scope;
@@ -53,7 +53,8 @@ export function httpError(status: number, body: unknown): OccuLiteError {
     }
     if (code === 'forbidden' && scope) message += ` (the credential lacks ${scope}: pair again with more access, or grant it in the API tokens panel)`;
     if (code === 'not_found') code = 'not-found';
-    return new OccuLiteError(code, message, {status, scope, detail: body});
+    // the API's own detail (has-members' refs, an import's error location) when it has one, else the whole body
+    return new OccuLiteError(code, message, {status, scope, detail: b.detail ?? body});
 }
 
 /** The client's word for a transport error: refused, dns, reset, timeout, or the OS code as it is. */

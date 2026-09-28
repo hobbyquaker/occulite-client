@@ -7,7 +7,7 @@
 
 import {META_SNAPSHOT_KEY, descriptionKey, memoryCache, type DescriptionCache} from './cache.ts';
 import {OccuLiteError, abortError, httpError, timeoutSignal} from './errors.ts';
-import {MetaCopy, type MetaDocument, type MetaEvent} from './meta.ts';
+import {MetaCopy, type MetaDocument, type MetaEvent, type WriteOptions, type WriteResult} from './meta.ts';
 import {datapointRef, deviceOf, parseDatapointRef, parseRef, ref as mkRef} from './refs.ts';
 import {parseSSE} from './sse.ts';
 import {fetchTransport, type Transport} from './transport.ts';
@@ -204,6 +204,54 @@ export class OccuLite {
         this.tx = opts.transport ?? fetchTransport();
         this.cache = opts.cache ?? memoryCache();
         if (opts.auth && !isProvider(opts.auth)) this.takeAuth(opts.auth);
+        this.meta.attach({
+            write: (method, path, body, o) => this.metaWrite(method, path, body, o),
+            read: (path, o) => this.metaRead(path, o),
+        });
+    }
+
+    /** One metadata API write: If-Match, the query, the body (a DELETE carries `{}`: lighttpd's
+     *  mod_proxy answers 411 to a body-less one), a 304 read as {changed: false} with the revision
+     *  from its ETag, the API's error codes as they are. */
+    private async metaWrite(method: string, path: string, body: unknown, o: WriteOptions & {query?: Record<string, string>; contentType?: string}): Promise<WriteResult> {
+        const q = o.query ? `?${new URLSearchParams(o.query)}` : '';
+        const h: Record<string, string> = {'Content-Type': o.contentType ?? 'application/json'};
+        if (o.ifMatch !== undefined) h['If-Match'] = String(o.ifMatch);
+        const raw = typeof body === 'string' ? body : JSON.stringify(body ?? {});
+        this.inflight++;
+        try {
+            const signal = timeoutSignal(this.opts.timeout ?? 30000, this.abort.signal, o.signal);
+            let r = await this.tx.request(method, `${this.url}/api/meta/v1${path}${q}`, this.headers(h), raw, signal);
+            if (r.status === 401 && (await this.resolveAuth('unauthenticated'))) r = await this.tx.request(method, `${this.url}/api/meta/v1${path}${q}`, this.headers(h), raw, signal);
+            if (r.status === 304) return {revision: Number(r.headers.etag?.replace(/"/g, '')) || this.meta.revision, changed: false};
+            let parsed: unknown;
+            try {
+                parsed = r.body ? JSON.parse(r.body) : undefined;
+            } catch {
+                parsed = r.body;
+            }
+            if (r.status < 200 || r.status > 299) throw httpError(r.status, parsed);
+            const a = (parsed ?? {}) as {revision?: number; changed?: boolean};
+            return {revision: typeof a.revision === 'number' ? a.revision : this.meta.revision, changed: a.changed !== false};
+        } finally {
+            this.inflight--;
+        }
+    }
+
+    private async metaRead<T>(path: string, o: {signal?: AbortSignal; raw?: boolean} = {}): Promise<T> {
+        if (!o.raw) return this.request<T>('GET', `/api/meta/v1${path}`, undefined, {signal: o.signal});
+        const signal = timeoutSignal(this.opts.timeout ?? 30000, this.abort.signal, o.signal);
+        const r = await this.tx.request('GET', `${this.url}/api/meta/v1${path}`, this.headers(), undefined, signal);
+        if (r.status < 200 || r.status > 299) {
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(r.body);
+            } catch {
+                parsed = r.body;
+            }
+            throw httpError(r.status, parsed);
+        }
+        return r.body as unknown as T;
     }
 
     private takeAuth(a: Auth & {credential?: Credential}): boolean {
@@ -891,14 +939,14 @@ export class OccuLite {
         return this.request('GET', `/api/rpc/v1/history?${q}`);
     }
 
-    async rename(ref: string, name: string): Promise<void> {
-        await this.request('PATCH', `/api/meta/v1/objects/${encodeURIComponent(ref)}`, {name});
+    /** box.meta.objects.rename(): PATCH {name}. */
+    rename(ref: string, name: string, opts: WriteOptions = {}): Promise<WriteResult> {
+        return this.meta.objects.rename(ref, name, opts);
     }
 
-    async assign(ref: string, path: string, member: boolean): Promise<void> {
-        const cur = this.meta.object(ref)?.enums ?? [];
-        const enums = member ? [...new Set([...cur, path])] : cur.filter((p) => p !== path);
-        await this.request('PATCH', `/api/meta/v1/objects/${encodeURIComponent(ref)}`, {enums});
+    /** box.meta.objects.assign(): PATCH {enums} with one path added or removed. */
+    assign(ref: string, path: string, member: boolean, opts: WriteOptions = {}): Promise<WriteResult> {
+        return this.meta.objects.assign(ref, path, member, opts);
     }
 
     /** A new secret for this client's token (task 219); the old one stays valid a minute. The

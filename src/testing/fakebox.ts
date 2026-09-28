@@ -28,6 +28,8 @@ export interface FakeBoxOptions {
     interfacesRoute?: boolean;
     /** false: the metadata snapshot answers 503 (a system whose metadata is not up yet) */
     metaRoute?: boolean;
+    /** refs a DELETE of an enum or node without members=detach is refused for (409 has-members) */
+    metaMembers?: string[];
     /** device descriptions per interface (listDevices) */
     devices?: Record<string, Record<string, unknown>[]>;
     /** VALUES paramset descriptions by `<interface>.<channel>` */
@@ -58,6 +60,8 @@ export class FakeBox {
     url = '';
     readonly calls: {interface: string; method: string; params: unknown[]}[] = [];
     readonly metaPatches: {ref: string; body: unknown}[] = [];
+    /** every metadata write: method, path (below /api/meta/v1, with the query), body, If-Match */
+    readonly metaWrites: {method: string; path: string; body: unknown; ifMatch?: string; contentType?: string}[] = [];
     bootId = 'boot1';
     private server: http.Server;
     private streams = new Set<Stream>();
@@ -364,10 +368,40 @@ export class FakeBox {
             req.on('close', () => this.metaStreams.delete(res));
             return;
         }
-        const om = /^\/api\/meta\/v1\/objects\/(.+)$/.exec(path);
-        if (req.method === 'PATCH' && om) {
-            this.metaPatches.push({ref: decodeURIComponent(om[1]), body: await this.body(req)});
-            return this.json(res, 200, {revision: (this.opts.meta?.revision ?? 0) + 1});
+        if (key === 'GET /api/meta/v1/enums') return this.json(res, 200, {revision: this.opts.meta?.revision ?? 0, enums: this.opts.meta?.enums ?? {}});
+        if (key === 'GET /api/meta/v1/export') {
+            const doc = {format: 1, ...(this.opts.meta ?? {revision: 0, objects: {}, enums: {}})};
+            if (u.searchParams.get('format') === 'yaml') {
+                res.writeHead(200, {'Content-Type': 'application/yaml', 'Content-Disposition': 'attachment; filename=meta.yaml'});
+                return void res.end(`format: 1\nrevision: ${doc.revision}\n`);
+            }
+            return this.json(res, 200, doc);
+        }
+        // the metadata writes: recorded, one revision each, If-Match checked, a {} PATCH is a 304 - the shapes of
+        // docs/meta-api.md without the store's semantics (the copy follows the change stream, which a test drives)
+        if (path.startsWith('/api/meta/v1/') && (req.method === 'PUT' || req.method === 'PATCH' || req.method === 'POST' || req.method === 'DELETE')) {
+            if (this.lacks('meta:write')) return this.json(res, 403, {error: 'forbidden', scope: 'meta:write', message: 'the credential lacks meta:write'});
+            const meta = (this.opts.meta ??= {revision: 0, objects: {}, enums: {}});
+            const ct = String(req.headers['content-type'] ?? '');
+            let raw = '';
+            for await (const c of req) raw += c;
+            const b = raw && ct.includes('json') ? JSON.parse(raw) : raw || undefined;
+            const rel = path.slice('/api/meta/v1'.length) + (u.search || '');
+            const ifMatch = req.headers['if-match'] as string | undefined;
+            this.metaWrites.push({method: req.method, path: rel, body: b, ifMatch, contentType: ct || undefined});
+            if (ifMatch !== undefined && Number(ifMatch.replace(/"/g, '')) !== meta.revision) return this.json(res, 409, {error: 'revision-conflict', message: `the store is at ${meta.revision}`, detail: {revision: meta.revision}});
+            const om = /^\/objects\/(.+)$/.exec(path.slice('/api/meta/v1'.length));
+            if (om && req.method === 'PATCH') {
+                this.metaPatches.push({ref: decodeURIComponent(om[1]), body: b});
+                if (b && typeof b === 'object' && Object.keys(b).length === 0) {
+                    res.writeHead(304, {ETag: `"${meta.revision}"`}).end();
+                    return;
+                }
+            }
+            if (path.endsWith('/nodes') && req.method === 'POST' && b?.parent && b.parent !== null && String(b.parent).includes('nowhere')) return this.json(res, 422, {error: 'unknown-path', message: `no such path: ${b.parent}`});
+            if (path.startsWith('/api/meta/v1/enums/') && req.method === 'DELETE' && !u.searchParams.has('members') && this.opts.metaMembers?.length) return this.json(res, 409, {error: 'has-members', message: 'members', detail: {refs: this.opts.metaMembers}});
+            meta.revision++;
+            return this.json(res, req.method === 'POST' && (path.endsWith('/enums') || path.endsWith('/nodes')) ? 201 : 200, {revision: meta.revision, changed: true});
         }
         this.json(res, 404, {error: 'not_found', message: `no route ${key}`});
     }

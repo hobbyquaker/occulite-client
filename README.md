@@ -81,6 +81,7 @@ await box.setValue('HmIP-RF.000A1B2C3D4E5F:4.LEVEL', 1)   // a FLOAT goes as a d
 await box.call('BidCos-RF', 'getLinks', ['JEQ0230153:1', 0])
 box.meta.name('HmIP-RF.000A1B2C3D4E5F:4')
 box.meta.rooms({inherit: true})
+box.meta.membership(ref)                            // {rooms: [{path, id, name, depth}], functions} - most specific first
 await box.history('HmIP-RF.000A1B2C3D4E5F:1.ACTUAL_TEMPERATURE', {maxPoints: 288})
 ```
 
@@ -98,6 +99,36 @@ devices) named - a device paired later is swept on its own. On the air it costs 
 from its cache); rfd asks a BidCos actuator for its status on every `getParamset(VALUES)`, so the sweep reads a BidCos
 channel once and never as a poll, and leaves out a BidCos device whose `UNREACH` is set. The stream keeps everything
 current afterwards.
+
+### The metadata
+
+`box.meta` is a live copy of the system's names and taxonomy (rooms, functions and any other enum - trees, not
+ReGa's flat lists): the snapshot at connect, then the change stream applied in place. Reads: `name(ref)`,
+`object(ref)`, `channels()`, `rooms()` / `functions()` / `nodes(enum, {inherit, lang})` (each node with its member
+refs; with `inherit` a node's members include its descendants'), `query(path, {orphaned})` (the format's subtree
+query, `unknown-path` for a path that is not there), `membership(ref, {inherit = true, lang})` (the nodes an object
+is in - the node and its ancestors, most specific first, as a program that showed ReGa's flat rooms wants them;
+`membershipNames()` gives the names, each once), `snapshot()`.
+
+The writes mirror the API's routes and every one answers `{revision, changed}` (`changed: false` for a `304`) and
+takes `{ifMatch: revision}` - `revision-conflict` when the store moved on:
+
+```js
+await box.meta.objects.patch(ref, {name, enums, meta}, {ifMatch})   // PATCH; put(), delete(), rename(), assign()
+await box.meta.objects.bulk({set: {[ref]: {name}}, delete: [ref]})  // one revision, all or nothing
+await box.meta.enums.create('floor', {de: 'Etagen', en: 'Floors'})  // update(id, {name}), delete(id, {detach}), list()
+await box.meta.tree.create('room', {parent: 'room/eg', id: 'bad', name: 'Bad', icon, position})
+await box.meta.tree.update('room/eg/bad', {name, icon, parent, position})   // parent: a move (null = to the root)
+await box.meta.tree.delete('room/eg/bad', {detach: true})           // has-members (detail.refs) without detach
+await box.meta.import(document, {mode: 'merge'})                    // a whole document (JSON, or YAML as a string)
+await box.meta.export({format: 'yaml'})
+```
+
+The errors are the API's, as `OccuLiteError.code` (`MetaErrorCode`): `unknown-object`, `unknown-path`,
+`duplicate-id`, `has-members` (with `detail.refs`), `invalid-move`, `revision-conflict`, `forbidden` naming
+`meta:write`, … The copy follows a `node.moved` (the member paths rewritten as the store did), a node's rename or
+icon and an enum's rename in place; a created or deleted node or enum and an import make it fetch the snapshot
+again. The tests run occulited's conformance corpus (its metadata fixtures) against the copy's tree semantics.
 
 **The description cache.** `paramsetDescription(ref, paramset)` is answered from a cache keyed by the device's
 `TYPE`, `FIRMWARE` and `VERSION`, the channel's `TYPE` and the paramset - `iface/TYPE/FIRMWARE/VERSION/chType/paramset`,

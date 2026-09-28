@@ -47,7 +47,9 @@ test('the metadata copy: events in place, a gap asks for a snapshot, the tree', 
     const direct = m.rooms();
     assert.deepEqual(direct.map((n) => [n.path, n.name, n.refs]), [['room/eg', 'EG', []], ['room/eg/wz', 'Wohnzimmer', ['HmIP-RF.A:1']]]);
     assert.deepEqual(m.rooms({inherit: true})[0].refs, ['HmIP-RF.A:1']);
-    assert.deepEqual(m.membership('HmIP-RF.A:1'), {rooms: ['Wohnzimmer'], functions: []});
-    assert.deepEqual(m.membership('HmIP-RF.B:1', 'en'), {rooms: [], functions: ['Light']});
+    assert.deepEqual(m.membershipNames('HmIP-RF.A:1'), {rooms: ['Wohnzimmer', 'EG'], functions: []}, 'most specific first, the ancestors after');
+    assert.deepEqual(m.membershipNames('HmIP-RF.A:1', {inherit: false}), {rooms: ['Wohnzimmer'], functions: []});
+    assert.deepEqual(m.membership('HmIP-RF.B:1', {lang: 'en'}).functions, [{path: 'function/licht', id: 'licht', name: 'Light', depth: 1}]);
+    assert.deepEqual(m.membershipNames('HmIP-RF.B:1', {lang: 'de'}), {rooms: [], functions: ['Licht']});
     assert.deepEqual(m.channels().map((c) => c.ref), ['HmIP-RF.A:1', 'HmIP-RF.B:1']);
 });

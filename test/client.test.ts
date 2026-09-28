@@ -239,7 +239,7 @@ test('X-Occulite-Request on every request: a cookie-only write passes, one witho
     assert.equal(raw.status, 403);
     assert.equal(((await raw.json()) as {error: string}).error, 'request-header');
     // a Bearer needs none
-    const bearer = await fetch(`${cookieBox.url}/api/meta/v1/objects/x`, {method: 'PATCH', headers: {Authorization: `Bearer ${sid}`, 'Content-Type': 'application/json'}, body: '{}'});
+    const bearer = await fetch(`${cookieBox.url}/api/meta/v1/objects/x`, {method: 'PATCH', headers: {Authorization: `Bearer ${sid}`, 'Content-Type': 'application/json'}, body: '{"name":"y"}'});
     assert.equal(bearer.status, 200);
 });
 
