@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`docs/porting.md` complete:** the worked example (hm2mqtt.js's structure before and after its port, `backend/lite.js`
+  in outline), *`box.values` is not every datapoint* and the sweep (the draft's *no sweep at start* row was wrong),
+  the `callbacks` module's argument lists and what it never emits, the four credentials and the tiers a method needs
+  (an unknown method needs *administer*), the two streams per token, detection (*a timeout is never a CCU*,
+  `probeUntil`), the system slice in the HM-Script and homematic-rega tables, reverse proxies, a CHANGELOG checklist
+  of what changes for a consumer's users, and the CommonJS note (`require(esm)`, load it lazily). A test
+  `require()`s the built `dist` from a `.cjs` file (every entry point).
+
 - **The system API's slice, `box.system`** (typed, thin): `status()`, `radioHealth()`, `serviceMessages()`,
   `groups.list/types/get/create/update/remove` (a write waits `GROUPS_TIMEOUT`, 45 s; a DELETE carries `{}`),
   `datastore.history()` and `datastore.history({add, remove})`; every method rejects `unsupported` without a request
