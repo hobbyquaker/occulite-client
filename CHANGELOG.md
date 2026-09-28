@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Credentials: `auth` takes an `AuthProvider` beside `{token}`/`{session}`; `occulite-client/node` has
+  `nodeAuth('auto' | {token} | {session} | {addon} | {local: true})` - `'auto'` is `OCCULITE_TOKEN`, the addon's
+  token file, the local token, none - and `createClient({url, auth, trust, addon, …})` wiring it with the pinned
+  transport. The token files are read again once after a `401`. `box.credential` says which one is in use; without
+  any, `ready()` rejects `unauthenticated` with the hint to pair (a system answering `authenticated: false` too).
+- **Names-only mode:** a credential without `rpc:read` (the local token) no longer ends `ready()` at
+  `/api/rpc/v1/interfaces`; the client loads and follows the metadata only, `box.mode === 'names-only'`, and every
+  RPC method rejects `forbidden` naming `rpc:read` without a request. `FakeBox` answers the open auth state with
+  `authenticated: false` to a request without any credential.
+
 - Timeouts everywhere: `timeout` per request (default 30 s; `request(…, {timeout, signal})` per call),
   `connectTimeout` for the whole `ready()`, `ready({signal})`; a request the system does not answer rejects
   `timeout`, an aborted one `aborted` - both distinct from `unreachable`. A stream silent for `streamTimeout`

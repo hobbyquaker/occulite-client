@@ -26,9 +26,23 @@ export interface Auth {
     session?: string;
 }
 
+/** Which credential the client uses - for a consumer's status line and its hints. */
+export type Credential = 'token' | 'addon' | 'local' | 'session' | 'none';
+
+/** A credential found at connect and again after a 401 (occulite-client/node's nodeAuth() reads the
+ *  addon's and the local token file this way, so a token created later is picked up without a restart). */
+export interface AuthProvider {
+    resolve(reason: 'start' | 'unauthenticated'): Promise<Auth & {credential?: Credential}> | (Auth & {credential?: Credential});
+}
+
+/** full: devices, values and requests over lite-rpc; names-only: the credential lacks rpc:read (the
+ *  local token, say), so only the metadata is loaded and followed and every RPC method rejects forbidden. */
+export type Mode = 'full' | 'names-only';
+
 export interface Options {
     url: string;
-    auth?: Auth;
+    /** the credential, or a provider that finds one (occulite-client/node: nodeAuth('auto')) */
+    auth?: Auth | AuthProvider;
     transport?: Transport;
     /** the interfaces to follow; default every interface the system offers */
     interfaces?: string[];
@@ -112,6 +126,7 @@ interface ParamDesc {
 }
 
 const ms = (s: string | undefined): number | undefined => (s ? Date.parse(s) : undefined);
+const isProvider = (a: Auth | AuthProvider): a is AuthProvider => typeof (a as AuthProvider).resolve === 'function';
 
 export class OccuLite {
     readonly url: string;
@@ -119,6 +134,10 @@ export class OccuLite {
     info: Info = {};
     capabilities: Capabilities = {};
     scopes: string[] = [];
+    /** which credential is in use */
+    credential: Credential = 'none';
+    /** full, or names-only for a credential without rpc:read */
+    mode: Mode = 'full';
     /** the interfaces followed, with their state: from GET /api/rpc/v1/interfaces (rpc:read), else
      *  learned from the stream's hello; kept live from the interface events */
     interfaces: InterfaceInfo[] = [];
@@ -131,6 +150,8 @@ export class OccuLite {
     inflight = 0;
 
     private tx: Transport;
+    private auth: Auth = {};
+    private reauthAt = 0;
     private handlers = new Map<string, Set<Handler>>();
     private abort = new AbortController();
     private lastEventId = '';
@@ -151,6 +172,25 @@ export class OccuLite {
         this.opts = opts;
         this.url = opts.url.replace(/\/+$/, '');
         this.tx = opts.transport ?? fetchTransport();
+        if (opts.auth && !isProvider(opts.auth)) this.takeAuth(opts.auth);
+    }
+
+    private takeAuth(a: Auth & {credential?: Credential}): boolean {
+        const before = this.auth.token ?? this.auth.session;
+        this.auth = a; // the object itself: rotateToken() writes the new secret into it for the consumer
+        this.credential = a.credential ?? (a.token ? 'token' : a.session ? 'session' : 'none');
+        return (a.token ?? a.session) !== before;
+    }
+
+    /** Asks the provider (when there is one); true when the credential changed. */
+    private async resolveAuth(reason: 'start' | 'unauthenticated'): Promise<boolean> {
+        const a = this.opts.auth;
+        if (!a || !isProvider(a)) return false;
+        if (reason === 'unauthenticated') {
+            if (Date.now() - this.reauthAt < 30000) return false; // once, not on every refused call
+            this.reauthAt = Date.now();
+        }
+        return this.takeAuth(await a.resolve(reason));
     }
 
     // ---- events ------------------------------------------------------------------------------
@@ -183,9 +223,8 @@ export class OccuLite {
 
     private headers(extra: Record<string, string> = {}): Record<string, string> {
         const h: Record<string, string> = {[REQUEST_HEADER]: '1', ...extra};
-        const a = this.opts.auth;
-        if (a?.token) h.Authorization = `Bearer ${a.token}`;
-        else if (a?.session) h.Authorization = `Bearer ${a.session}`;
+        if (this.auth.token) h.Authorization = `Bearer ${this.auth.token}`;
+        else if (this.auth.session) h.Authorization = `Bearer ${this.auth.session}`;
         return h;
     }
 
@@ -195,7 +234,11 @@ export class OccuLite {
         this.inflight++;
         try {
             const signal = timeoutSignal(opts.timeout ?? this.opts.timeout ?? 30000, this.abort.signal, opts.signal);
-            const r = await this.tx.request(method, this.url + path, this.headers(body === undefined ? {} : {'Content-Type': 'application/json'}), body === undefined ? undefined : JSON.stringify(body), signal);
+            const raw = body === undefined ? undefined : JSON.stringify(body);
+            const ct: Record<string, string> = body === undefined ? {} : {'Content-Type': 'application/json'};
+            let r = await this.tx.request(method, this.url + path, this.headers(ct), raw, signal);
+            // a refused credential: the provider may know a newer one (a token file rewritten) - once
+            if (r.status === 401 && (await this.resolveAuth('unauthenticated'))) r = await this.tx.request(method, this.url + path, this.headers(ct), raw, signal);
             let parsed: unknown = undefined;
             if (r.body) {
                 try {
@@ -239,6 +282,7 @@ export class OccuLite {
 
     private async connectSteps(signal?: AbortSignal): Promise<void> {
         this.setStatus('connecting');
+        await this.resolveAuth('start');
         const v = await this.request<Info & {capabilities?: Capabilities}>('GET', '/api/meta/v1/version', undefined, {signal}).catch((e: OccuLiteError) => {
             if (e.code === 'not-found' || e.status === 404) throw new OccuLiteError('unsupported', 'not an openccu-lite system (no /api/meta/v1/version)');
             throw e;
@@ -250,16 +294,22 @@ export class OccuLite {
             const mine = (SPEAKS as Record<string, number>)[api];
             if (mine !== undefined && major > mine) throw new OccuLiteError('unsupported', `the system speaks ${api} API ${major}; this client speaks ${mine} - update occulite-client`);
         }
+        const unauth = () => new OccuLiteError('unauthenticated', this.credential === 'none' ? 'no credential: pair this program with the system, or pass a token (auth: {token})' : `the ${this.credential} credential is not accepted by the system: pair again, or check the token`, {status: 401});
         const st = await this.request<{scopes?: string[]; authenticated?: boolean}>('GET', '/api/auth/v1/state', undefined, {signal}).catch((e: OccuLiteError) => {
-            if (signal?.aborted) throw e;
-            return {scopes: []};
+            if (e.code === 'unauthenticated') throw unauth();
+            if (e.code === 'not-found' || e.code === 'unsupported') return {} as {scopes?: string[]; authenticated?: boolean}; // no auth state to read: assume full access
+            throw e;
         });
+        if (st.authenticated === false) throw unauth();
         this.scopes = st.scopes ?? [];
-        await this.loadInterfaces(signal);
-        await Promise.all([this.opts.values === false ? undefined : this.loadValues(signal), this.opts.meta === false ? undefined : this.loadMeta(signal)]);
+        const rpc = st.scopes === undefined || this.scopes.includes('*') || this.scopes.includes('rpc:read');
+        this.mode = rpc ? 'full' : 'names-only';
+        if (rpc) await this.loadInterfaces(signal);
+        await Promise.all([this.opts.values === false || !rpc ? undefined : this.loadValues(signal), this.opts.meta === false ? undefined : this.loadMeta(signal)]);
         if (signal?.aborted) throw abortError(signal, 'connecting');
-        const devicesDone = this.opts.devices === false ? Promise.resolve() : new Promise<void>((res) => (this.devicesWaiter = res));
-        void this.runStream();
+        const devicesDone = this.opts.devices === false || !rpc ? Promise.resolve() : new Promise<void>((res) => (this.devicesWaiter = res));
+        if (rpc) void this.runStream();
+        else this.opts.log?.info?.(`occulite-client: names only - the ${this.credential} credential lacks rpc:read; pair for devices and values`);
         if (this.opts.meta !== false) void this.runMetaStream();
         let timer: ReturnType<typeof setTimeout> | undefined;
         const gaveUp = new Promise<void>((res) => (timer = setTimeout(res, this.opts.readyTimeout ?? 30000)));
@@ -396,6 +446,7 @@ export class OccuLite {
                         /* text */
                     }
                     const err = httpError(s.status, body);
+                    if (s.status === 401 && (await this.resolveAuth('unauthenticated'))) continue; // a newer token: again, at once
                     this.emit('error', err);
                     if (s.status === 401 || s.status === 403) {
                         this.setStatus('offline');
@@ -560,8 +611,14 @@ export class OccuLite {
 
     private rpcId = 0;
 
+    /** names-only: every RPC method rejects forbidden naming rpc:read, without a request. */
+    private rpcGuard(): void {
+        if (this.mode === 'names-only') throw new OccuLiteError('forbidden', `names only: the ${this.credential} credential lacks rpc:read - pair this program with the system for devices and values`, {status: 403, scope: 'rpc:read'});
+    }
+
     /** Any method of an interface process; the credential's tier decides (task 78). */
     async call<T = unknown>(iface: string, method: string, params: unknown[] = []): Promise<T> {
+        this.rpcGuard();
         const r = await this.request<{result?: T; error?: {code: number; message: string}}>('POST', `/api/rpc/v1/json/${encodeURIComponent(iface)}`, {jsonrpc: '2.0', method, params, id: ++this.rpcId});
         if (r?.error) throw new OccuLiteError('rpc-fault', r.error.message, {faultCode: r.error.code, method});
         return r?.result as T;
@@ -569,6 +626,7 @@ export class OccuLite {
 
     /** Several calls in one request (a JSON-RPC batch). */
     async batch(iface: string, calls: [string, unknown[]][]): Promise<unknown[]> {
+        this.rpcGuard();
         const body = calls.map(([method, params]) => ({jsonrpc: '2.0', method, params, id: ++this.rpcId}));
         const r = await this.request<{id: number; result?: unknown; error?: {code: number; message: string}}[]>('POST', `/api/rpc/v1/json/${encodeURIComponent(iface)}`, body);
         const byId = new Map((r ?? []).map((x) => [x.id, x]));
@@ -625,6 +683,7 @@ export class OccuLite {
 
     /** One datapoint's history (task 195): [[ms, value], …]. */
     async history(datapoint: string, opts: {from?: number | Date; to?: number | Date; maxPoints?: number} = {}): Promise<[number, unknown][]> {
+        this.rpcGuard();
         if (!this.capabilities.history) throw new OccuLiteError('unsupported', 'this system keeps no datapoint history');
         const {interface: i, address, key} = parseDatapointRef(datapoint);
         const q = new URLSearchParams({interface: i, address, datapoint: key});
@@ -648,7 +707,7 @@ export class OccuLite {
      *  client uses the new one from here on; store it. */
     async rotateToken(): Promise<string> {
         const r = await this.request<{token: string}>('POST', '/api/auth/v1/tokens/self/rotate', {});
-        if (this.opts.auth) this.opts.auth.token = r.token;
+        this.auth.token = r.token;
         return r.token;
     }
 }

@@ -101,8 +101,32 @@ tells the radio hardware): a credential without it, or an older system without t
 
 `auth: {token}` (a paired or created API token) or `auth: {session}` (a browser session id) go as
 `Authorization: Bearer`. Without either, the default `fetch` transport rides on the browser's session cookie
-(`credentials: 'same-origin'`) - so a page served by the system itself needs no option at all. Every request the
-client makes carries the header **`X-Occulite-Request: 1`**: openccu-lite refuses a state-changing call whose only
+(`credentials: 'same-origin'`) - so a page served by the system itself needs no option at all. **On the system, in
+Node,** `createClient()` from `occulite-client/node` resolves the credential for you:
+
+```js
+import {createClient} from 'occulite-client/node'
+
+const box = createClient({url: 'http://127.0.0.1', auth: 'auto', addon: 'hm2mqtt', trust: {fingerprint256}})
+// 'auto': OCCULITE_TOKEN in the environment → the addon's own token (/run/occulite/addon-tokens/<addon>.api,
+// from the manifest's runtime.api_scopes) → the local token (/usr/local/etc/occulite/local-token) → none
+await box.ready()
+box.credential   // 'token' | 'addon' | 'local' | 'session' | 'none' - for your status line
+box.mode         // 'full' | 'names-only'
+```
+
+`auth` also takes `{token}`, `{session}`, `{addon: '<id>'}`, `{local: true}` or your own `AuthProvider`
+(`{resolve(reason)}`); `localTokenFile` and `addonTokenDir` override the paths. The token files are read again once
+after a `401`, so a token created or minted later is picked up without a restart. Without any credential `ready()`
+rejects `unauthenticated` with the hint to pair or pass a token.
+
+**Names only.** The local token carries `meta:read` alone - every addon has it without any declaration. A credential
+without `rpc:read` puts the client in `mode: 'names-only'`: the metadata (names, rooms, functions) is loaded and
+followed, `ready()` resolves, and every RPC method (`setValue`, `call`, `history`, …) rejects `forbidden` naming
+`rpc:read` without a request; `box.devices` and `box.values` stay empty. Show *"names only: pair for devices and
+values"* and offer pairing.
+
+Every request the client makes carries the header **`X-Occulite-Request: 1`**: openccu-lite refuses a state-changing call whose only
 credential is the session cookie without it (`403 request-header`; a custom header is what a cross-site form post
 or link cannot send). A Bearer needs no such header; the client sends it anyway, which is harmless. A program that
 talks to the API on its own (not through this client) and replays the cookie for its writes has to send it too.

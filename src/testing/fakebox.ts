@@ -60,6 +60,8 @@ export class FakeBox {
     private ring: {seq: number; event: string; data: unknown}[] = [];
     /** how often a stream was opened (reconnects counted) */
     streamsOpened = 0;
+    /** the same for the metadata change stream */
+    metaStreamsOpened = 0;
     private held = new Set<{req: http.IncomingMessage; res: http.ServerResponse}>();
     readonly pairings = new Map<string, {poll: string; nonce: Buffer; commit: string; clientNonce?: Buffer; state: string; token?: string; access: unknown; app: string}>();
 
@@ -241,6 +243,8 @@ export class FakeBox {
             return this.json(res, 200, {state: p.state});
         }
         const verdict = this.authorized(req);
+        // the auth state is open: no credential at all is answered, not refused (the shell asks it to know)
+        if (key === 'GET /api/auth/v1/state' && verdict === 401 && !req.headers.authorization && !req.headers.cookie) return this.json(res, 200, {authenticated: false, setup_required: false});
         if (verdict === 401) return this.json(res, 401, {error: 'unauthenticated', message: 'login required'});
         if (verdict === 403) return this.json(res, 403, {error: 'request-header', message: 'a state-changing call with the session cookie alone must carry the header X-Occulite-Request'});
         if (key === 'GET /api/auth/v1/state') return this.json(res, 200, {authenticated: true, scopes: this.opts.scopes ?? ['*']});
@@ -321,6 +325,7 @@ export class FakeBox {
         }
         if (key === 'GET /api/meta/v1/snapshot') return this.json(res, 200, {format: 1, ...(this.opts.meta ?? {revision: 0, objects: {}, enums: {}})});
         if (key === 'GET /api/meta/v1/events/sse') {
+            this.metaStreamsOpened++;
             res.writeHead(200, {'Content-Type': 'text/event-stream'});
             res.write(': connected\n\n');
             this.metaStreams.add(res);

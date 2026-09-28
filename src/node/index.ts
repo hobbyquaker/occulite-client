@@ -3,12 +3,13 @@
 // client half of task 219), which binds its code to the certificate it saw.
 
 import {createHash, randomBytes} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
 import * as net from 'node:net';
 import * as tls from 'node:tls';
 import type {TLSSocket} from 'node:tls';
-import {REQUEST_HEADER} from '../client.ts';
+import {OccuLite, REQUEST_HEADER, type Auth, type AuthProvider, type Credential, type Options} from '../client.ts';
 import {OccuLiteError, abortError, httpError, timeoutSignal, transportReason, type CertificateInfo} from '../errors.ts';
 import type {Transport, TransportResponse} from '../transport.ts';
 
@@ -199,6 +200,73 @@ export async function probeUntil(address: string, opts: ProbeOptions & {schedule
             opts.signal?.addEventListener('abort', done, {once: true});
         });
     }
+}
+
+// ---- credentials on the system -----------------------------------------------------------------
+
+/** How a Node program names its credential: 'auto' looks in this order - OCCULITE_TOKEN in the
+ *  environment, the addon's own token (when `addon` is named), the local token (meta:read alone:
+ *  names only), none - and the files are read again after a 401, so a token created later is picked
+ *  up without a restart. */
+export type NodeAuth = 'auto' | {token: string} | {session: string} | {addon: string} | {local: true} | {none: true};
+
+export interface NodeAuthOptions {
+    /** the addon id for 'auto' and its token file /run/occulite/addon-tokens/<id>.api (the manifest's runtime.api_scopes) */
+    addon?: string;
+    /** default /usr/local/etc/occulite/local-token (meta:read; every addon may read it) */
+    localTokenFile?: string;
+    /** default /run/occulite/addon-tokens */
+    addonTokenDir?: string;
+    /** default process.env */
+    env?: Record<string, string | undefined>;
+}
+
+export const LOCAL_TOKEN_FILE = '/usr/local/etc/occulite/local-token';
+export const ADDON_TOKEN_DIR = '/run/occulite/addon-tokens';
+
+/** The first non-empty line of a token file, or undefined when it is not there or empty. */
+async function tokenFile(path: string): Promise<string | undefined> {
+    try {
+        const line = (await readFile(path, 'utf8')).split(/\r?\n/).find((l) => l.trim() !== '');
+        return line?.trim() || undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** The credential provider for OccuLite's `auth` option: `nodeAuth('auto', {addon: 'hm2mqtt'})`. */
+export function nodeAuth(spec: NodeAuth = 'auto', o: NodeAuthOptions = {}): AuthProvider & {spec: NodeAuth} {
+    const env = o.env ?? process.env;
+    const local = () => tokenFile(o.localTokenFile ?? LOCAL_TOKEN_FILE);
+    const addon = (id: string) => tokenFile(`${o.addonTokenDir ?? ADDON_TOKEN_DIR}/${id}.api`);
+    const found = (token: string | undefined, credential: Credential): (Auth & {credential: Credential}) | undefined => (token ? {token, credential} : undefined);
+    return {
+        spec,
+        async resolve() {
+            if (spec === 'auto') {
+                return found(env.OCCULITE_TOKEN, 'token') ?? (o.addon ? found(await addon(o.addon), 'addon') : undefined) ?? found(await local(), 'local') ?? {credential: 'none'};
+            }
+            if ('token' in spec) return {token: spec.token, credential: 'token'};
+            if ('session' in spec) return {session: spec.session, credential: 'session'};
+            if ('addon' in spec) return found(await addon(spec.addon), 'addon') ?? {credential: 'none'};
+            if ('local' in spec) return found(await local(), 'local') ?? {credential: 'none'};
+            return {credential: 'none'};
+        },
+    };
+}
+
+export interface CreateOptions extends Omit<Options, 'auth' | 'transport'>, NodeAuthOptions {
+    /** default 'auto' */
+    auth?: NodeAuth | AuthProvider;
+    /** the certificate to trust: the fingerprint pinned at pairing, a CA, or nothing for a valid certificate */
+    trust?: Trust;
+}
+
+/** An OccuLite for Node: the pinned https transport and the credential resolution in one call. */
+export function createClient(o: CreateOptions): OccuLite {
+    const {auth, trust, addon, localTokenFile, addonTokenDir, env, ...rest} = o;
+    const provider = auth && typeof (auth as AuthProvider).resolve === 'function' ? (auth as AuthProvider) : nodeAuth((auth as NodeAuth | undefined) ?? 'auto', {addon, localTokenFile, addonTokenDir, env});
+    return new OccuLite({...rest, auth: provider, transport: nodeTransport(trust)});
 }
 
 export interface PairOptions {
