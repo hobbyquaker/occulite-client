@@ -2,12 +2,21 @@
 // forbidden, too-many-streams, unknown-interface, down, unsupported, the metadata codes) and the
 // client's (unreachable, timeout, aborted, certificate, rpc-fault, protocol).
 
+/** One certificate as a trust dialog shows it (the subject's CN, the issuer's CN, the SHA-256,
+ *  the validity as OpenSSL prints it, the names) - and its PEM, for a store. */
 export interface CertificateInfo {
     subject?: string;
     issuer?: string;
+    /** SHA-256, `AB:CD:…` */
     fingerprint256?: string;
+    /** as OpenSSL prints it: `Dec 24 12:00:00 2026 GMT` */
     validFrom?: string;
     validTo?: string;
+    /** `DNS:lab.example, IP Address:10.0.0.2`, when the certificate has any */
+    altNames?: string;
+    /** true for a certificate authority */
+    ca?: boolean;
+    pem?: string;
 }
 
 export class OccuLiteError extends Error {
@@ -18,17 +27,25 @@ export class OccuLiteError extends Error {
     /** an XML-RPC fault of the interface process */
     readonly faultCode?: number;
     readonly method?: string;
-    /** the certificate a `certificate` error is about - for the consumer's trust dialog */
+    /** the certificate a `certificate` error is about (the leaf) - for the consumer's trust dialog */
     readonly certificate?: CertificateInfo;
+    /** the chain the system sent, the leaf first, as far as it went */
+    readonly chain?: CertificateInfo[];
+    /** the topmost authority in that chain, with its PEM: what a consumer's *Trust the CA* stores.
+     *  Absent for a self-signed certificate (pin its fingerprint instead) */
+    readonly ca?: CertificateInfo & {pem: string};
     readonly detail?: unknown;
 
-    /** an `unreachable` error's cause: refused, dns, reset, timeout, or the OS error code */
+    /** an `unreachable` error's cause: refused, dns, reset, timeout, or the OS error code; a
+     *  `certificate` error's: `pin` for the pinned fingerprint not matching, else Node's code
+     *  (`DEPTH_ZERO_SELF_SIGNED_CERT`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `CERT_HAS_EXPIRED`,
+     *  `ERR_TLS_CERT_ALTNAME_INVALID`, …) */
     get reason(): string | undefined {
         const d = this.detail as {code?: string} | undefined;
         return typeof d?.code === 'string' ? d.code : undefined;
     }
 
-    constructor(code: string, message: string, extra: {status?: number; scope?: string; faultCode?: number; method?: string; certificate?: CertificateInfo; detail?: unknown} = {}) {
+    constructor(code: string, message: string, extra: {status?: number; scope?: string; faultCode?: number; method?: string; certificate?: CertificateInfo; chain?: CertificateInfo[]; ca?: CertificateInfo & {pem: string}; detail?: unknown} = {}) {
         super(message);
         this.name = 'OccuLiteError';
         this.code = code;
@@ -37,6 +54,8 @@ export class OccuLiteError extends Error {
         this.faultCode = extra.faultCode;
         this.method = extra.method;
         this.certificate = extra.certificate;
+        this.chain = extra.chain;
+        this.ca = extra.ca;
         this.detail = extra.detail;
     }
 }

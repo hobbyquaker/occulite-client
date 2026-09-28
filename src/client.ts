@@ -11,6 +11,7 @@ import {MetaCopy, type MetaDocument, type MetaEvent, type WriteOptions, type Wri
 import {datapointRef, deviceOf, parseDatapointRef, parseRef, ref as mkRef} from './refs.ts';
 import {parseSSE} from './sse.ts';
 import {fetchTransport, type Transport} from './transport.ts';
+import type {DeviceDescription, ParamsetDescription} from './types.ts';
 
 /** The API majors this client speaks. */
 export const SPEAKS = {meta: 1, rpc: 1, system: 1, auth: 1};
@@ -133,23 +134,33 @@ export interface Capabilities {
     [k: string]: unknown;
 }
 
+/** What `GET /api/meta/v1/version` says about the HmIP network - the one radio fact in the open answer. */
+export interface HmipInfo {
+    /** `LOCAL` or `INTERNET`: how HmIP device keys are made */
+    keyserver_mode?: string;
+    /** device keys the system holds */
+    device_keys?: number;
+    offline_pairing?: boolean;
+    [k: string]: unknown;
+}
+
+/** The version answer (`GET /api/meta/v1/version`) without its capabilities. */
 export interface Info {
+    /** `occulited <version>` */
     implementation?: string;
     api?: string;
+    /** the metadata API's major */
     version?: number;
+    /** the metadata format's version */
+    format?: number;
+    /** the metadata store's revision at the time */
     revision?: number;
-    hmip?: unknown;
+    hmip?: HmipInfo;
 }
 
 export type Status = 'idle' | 'connecting' | 'ready' | 'degraded' | 'offline' | 'closed';
 
 type Handler = (arg: any) => void;
-
-interface ParamDesc {
-    TYPE?: string;
-    OPERATIONS?: number;
-    [k: string]: unknown;
-}
 
 const ms = (s: string | undefined): number | undefined => (s ? Date.parse(s) : undefined);
 const isProvider = (a: Auth | AuthProvider): a is AuthProvider => typeof (a as AuthProvider).resolve === 'function';
@@ -168,8 +179,8 @@ export class OccuLite {
      *  learned from the stream's hello; kept live from the interface events */
     interfaces: InterfaceInfo[] = [];
     readonly values = new Map<string, Value>();
-    /** device and channel descriptions by ref */
-    readonly devices = new Map<string, Record<string, unknown>>();
+    /** device and channel descriptions by ref, as listDevices gives them */
+    readonly devices = new Map<string, DeviceDescription>();
     readonly meta = new MetaCopy();
     status: Status = 'idle';
     /** requests in flight, for a consumer that paces its writes */
@@ -183,7 +194,7 @@ export class OccuLite {
     private abort = new AbortController();
     private lastEventId = '';
     private bootId = '';
-    private descCache = new Map<string, Promise<Record<string, ParamDesc>>>();
+    private descCache = new Map<string, Promise<ParamsetDescription>>();
     private batchBuf: ValueEvent[] = [];
     private batchMark = 0;
     private batchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -372,7 +383,7 @@ export class OccuLite {
             throw e;
         });
         if (!v || typeof v !== 'object' || v.api !== 'meta') throw new OccuLiteError('unsupported', 'not an openccu-lite system');
-        this.info = {implementation: v.implementation, api: v.api, version: v.version, revision: v.revision, hmip: v.hmip};
+        this.info = {implementation: v.implementation, api: v.api, version: v.version, format: v.format, revision: v.revision, hmip: v.hmip};
         this.capabilities = v.capabilities ?? {};
         for (const [api, major] of Object.entries(this.capabilities.apis ?? {})) {
             const mine = (SPEAKS as Record<string, number>)[api];
@@ -461,9 +472,9 @@ export class OccuLite {
         if (this.opts.devices === false || this.mode !== 'full' || this.fetching.has(iface)) return;
         this.fetching.add(iface);
         try {
-            const list = await this.call<Record<string, unknown>[]>(iface, 'listDevices');
+            const list = await this.call<DeviceDescription[]>(iface, 'listDevices');
             const want = addresses ? new Set(addresses) : undefined;
-            const descs: Record<string, unknown>[] = [];
+            const descs: DeviceDescription[] = [];
             for (const desc of Array.isArray(list) ? list : []) {
                 const a = desc?.ADDRESS as string | undefined;
                 if (!a) continue;
@@ -474,8 +485,8 @@ export class OccuLite {
             this.devicesSeen.add(iface);
             this.checkDevicesReady();
             this.opts.log?.debug?.(`occulite-client: listDevices on ${iface}: ${Array.isArray(list) ? list.length : 0} descriptions, ${descs.length} new`);
-            if (descs.length || want) this.emit('devices', {kind: 'new', interface: iface, refs: descs.map((x) => mkRef(iface, x.ADDRESS as string)), descriptions: descs});
-            if (descs.length && this.opts.values === 'all' && this.status === 'ready') void this.sweep(descs.map((x) => mkRef(iface, x.ADDRESS as string)));
+            if (descs.length || want) this.emit('devices', {kind: 'new', interface: iface, refs: descs.map((x) => mkRef(iface, x.ADDRESS)), descriptions: descs});
+            if (descs.length && this.opts.values === 'all' && this.status === 'ready') void this.sweep(descs.map((x) => mkRef(iface, x.ADDRESS)));
         } catch (e) {
             this.opts.log?.warn?.(`occulite-client: listDevices on ${iface} failed: ${(e as Error).message}`);
             if (addresses) this.emit('devices', {kind: 'new', interface: iface, refs: addresses.map((a) => mkRef(iface, a))});
@@ -616,7 +627,7 @@ export class OccuLite {
         return all.filter((r) => want.has(r) || want.has(r.slice(0, r.lastIndexOf(':'))));
     }
 
-    private async skipSweep(iface: string, address: string, desc: Record<string, unknown> | undefined): Promise<boolean> {
+    private async skipSweep(iface: string, address: string, desc: DeviceDescription | undefined): Promise<boolean> {
         const paramsets = desc?.PARAMSETS;
         if (Array.isArray(paramsets) && !paramsets.includes('VALUES')) return true;
         // a BidCos device that does not answer costs rfd's retries on the air for nothing; hmipserver answers from its cache
@@ -868,25 +879,25 @@ export class OccuLite {
     }
 
     /** A VALUES description the cache has, without a request; undefined otherwise. */
-    private async cachedDescription(channelRef: string): Promise<Record<string, ParamDesc> | undefined> {
+    private async cachedDescription(channelRef: string): Promise<ParamsetDescription | undefined> {
         const k = this.descriptionKey(channelRef);
         const v = k ? await Promise.resolve(this.cache.get(k)).catch(() => undefined) : undefined;
-        return (v as Record<string, ParamDesc> | undefined) ?? (await this.descCache.get(`${channelRef}|VALUES`)?.catch(() => undefined));
+        return (v as ParamsetDescription | undefined) ?? (await this.descCache.get(`${channelRef}|VALUES`)?.catch(() => undefined));
     }
 
     /** A channel's paramset description: from the cache by device type, firmware, version and
      *  channel type (one getParamsetDescription per type, across restarts with a fileCache), else
      *  fetched and cached; a channel not in box.devices is asked per channel. */
-    paramsetDescription(channelRef: string, paramset = 'VALUES'): Promise<Record<string, ParamDesc>> {
+    paramsetDescription(channelRef: string, paramset = 'VALUES'): Promise<ParamsetDescription> {
         const k = `${channelRef}|${paramset}`;
         let p = this.descCache.get(k);
         if (!p) {
             const {interface: i, address} = parseRef(channelRef);
             const key = this.descriptionKey(channelRef, paramset);
             p = (async () => {
-                const hit = key ? ((await Promise.resolve(this.cache.get(key)).catch(() => undefined)) as Record<string, ParamDesc> | undefined) : undefined;
+                const hit = key ? ((await Promise.resolve(this.cache.get(key)).catch(() => undefined)) as ParamsetDescription | undefined) : undefined;
                 if (hit) return hit;
-                const d = await this.call<Record<string, ParamDesc>>(i, 'getParamsetDescription', [address, paramset]);
+                const d = await this.call<ParamsetDescription>(i, 'getParamsetDescription', [address, paramset]);
                 if (key) await Promise.resolve(this.cache.set(key, d)).catch((e) => this.opts.log?.warn?.(`occulite-client: the cache did not take ${key}: ${(e as Error).message}`));
                 return d;
             })();

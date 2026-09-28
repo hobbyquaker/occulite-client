@@ -32,7 +32,7 @@ test('ready() does not wait for an interface that is not running; its devices co
     const ev = events.find((e) => e.interface === 'BidCos-Wired')!;
     assert.equal(ev.kind, 'new');
     assert.deepEqual(ev.refs, ['BidCos-Wired.W1', 'BidCos-Wired.W1:1']);
-    assert.equal((ev.descriptions as {ADDRESS: string}[])[1].PARENT, 'W1');
+    assert.equal((ev.descriptions as {ADDRESS: string; PARENT?: string}[])[1].PARENT, 'W1');
 });
 
 test('an interface that appears after connect is followed; a newDevices with addresses only gets its descriptions', async (t) => {

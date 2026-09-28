@@ -11,7 +11,7 @@ import * as net from 'node:net';
 import * as tls from 'node:tls';
 import type {TLSSocket} from 'node:tls';
 import type {DescriptionCache} from '../cache.ts';
-import {OccuLite, REQUEST_HEADER, type Auth, type AuthProvider, type Credential, type Options} from '../client.ts';
+import {OccuLite, REQUEST_HEADER, type Auth, type AuthProvider, type Capabilities, type Credential, type Info, type Options} from '../client.ts';
 import {OccuLiteError, abortError, httpError, timeoutSignal, transportReason, type CertificateInfo} from '../errors.ts';
 import type {Transport, TransportResponse} from '../transport.ts';
 
@@ -31,70 +31,138 @@ export function fingerprint256(der: Buffer): string {
     return createHash('sha256').update(der).digest('hex').toUpperCase().match(/../g)!.join(':');
 }
 
+/** What one connection showed: the leaf, the chain as sent (the leaf first), the CA to offer. */
 interface Seen {
     fingerprint?: string;
     cert?: CertificateInfo;
+    chain?: CertificateInfo[];
+    ca?: CertificateInfo & {pem: string};
+}
+
+/** A DER certificate as PEM. */
+export function toPEM(der: Buffer): string {
+    return `-----BEGIN CERTIFICATE-----\n${der.toString('base64').match(/.{1,64}/g)!.join('\n')}\n-----END CERTIFICATE-----\n`;
+}
+
+/** One certificate for a trust dialog: the CN of subject and issuer, the SHA-256, the validity, the names, the PEM. */
+export function describeCertificate(cert: tls.PeerCertificate): CertificateInfo {
+    const cn = (v: string | string[] | undefined) => (Array.isArray(v) ? v.join(', ') : v);
+    const raw = cert.raw as Buffer | undefined;
+    return {
+        subject: cn(cert.subject?.CN) ?? cn(cert.subject?.O),
+        issuer: cn(cert.issuer?.CN) ?? cn(cert.issuer?.O),
+        fingerprint256: cert.fingerprint256,
+        validFrom: cert.valid_from,
+        validTo: cert.valid_to,
+        ...(cert.subjectaltname ? {altNames: cert.subjectaltname} : {}),
+        ...(typeof (cert as {ca?: boolean}).ca === 'boolean' ? {ca: (cert as {ca?: boolean}).ca} : {}),
+        ...(raw ? {pem: toPEM(raw)} : {}),
+    };
+}
+
+/** The chain as the peer sent it, the leaf first; a root is its own issuer, so the walk ends there. */
+function chainOf(leaf: tls.DetailedPeerCertificate): tls.DetailedPeerCertificate[] {
+    const out: tls.DetailedPeerCertificate[] = [];
+    const seen = new Set<string>();
+    for (let c: tls.DetailedPeerCertificate | undefined = leaf; c && !seen.has(c.fingerprint256); c = c.issuerCertificate) {
+        seen.add(c.fingerprint256);
+        out.push(c);
+    }
+    return out;
+}
+
+/** What the socket showed, once the handshake is through: the topmost authority in the chain is the
+ *  CA to offer (a step-ca sends only its intermediate; that one is trusted as a partial chain). */
+function recordPeer(sock: tls.TLSSocket, seen: Seen): void {
+    const leaf = sock.getPeerCertificate(true);
+    if (!leaf || !Object.keys(leaf).length) return;
+    const chain = chainOf(leaf);
+    seen.fingerprint = leaf.fingerprint256;
+    seen.cert = describeCertificate(leaf);
+    seen.chain = chain.map(describeCertificate);
+    const ca = chain.slice(1).reverse().find((c) => (c as {ca?: boolean}).ca === true);
+    if (ca) seen.ca = describeCertificate(ca) as CertificateInfo & {pem: string};
+}
+
+/** The CA list for a trust with a CA of its own: Node's defaults plus it (the `ca` option alone replaces them). */
+function caList(ca: string): string[] {
+    const t = tls as unknown as {getCACertificates?: (kind: string) => string[]; rootCertificates: string[]};
+    return [...(typeof t.getCACertificates === 'function' ? t.getCACertificates('default') : t.rootCertificates), ca];
+}
+
+/** The reason a certificate was refused: the pin, or Node's word for the chain or name problem. */
+class CertRefused extends Error {
+    readonly reason: string;
+    constructor(reason: string) {
+        super(reason);
+        this.reason = reason;
+    }
 }
 
 function options(url: URL, trust: Trust | undefined, headers: Record<string, string>, method: string, seen: Seen, signal?: AbortSignal): https.RequestOptions {
     const o: https.RequestOptions = {method, headers, signal, hostname: url.hostname, port: url.port || undefined, path: url.pathname + url.search};
     if (url.protocol !== 'https:') return o;
-    const record = (cert: tls.PeerCertificate) => {
-        const cn = (v: string | string[] | undefined) => (Array.isArray(v) ? v.join(', ') : v);
-        seen.fingerprint = cert.fingerprint256;
-        seen.cert = {subject: cn(cert.subject?.CN), issuer: cn(cert.issuer?.CN), fingerprint256: cert.fingerprint256, validFrom: cert.valid_from, validTo: cert.valid_to};
-    };
-    if (trust?.fingerprint256 || trust?.insecure) {
-        // the pin (or pairing's first contact): our own TLS socket, handed to the request only after
-        // the handshake and the fingerprint check - nothing, the credential least of all, is written
-        // to a server that shows another certificate. (Node skips checkServerIdentity when the
-        // chain does not verify, so a self-signed certificate cannot be pinned there.)
-        const pin = trust.fingerprint256 ? norm(trust.fingerprint256) : '';
-        o.createConnection = ((_opts: unknown, oncreate: (err: Error | null, s?: tls.TLSSocket) => void) => {
-            const sock = tls.connect({host: url.hostname, port: Number(url.port || 443), servername: net.isIP(url.hostname) ? undefined : url.hostname, rejectUnauthorized: false, ca: trust.ca});
-            sock.once('secureConnect', () => {
-                const cert = sock.getPeerCertificate();
-                record(cert);
-                if (pin && norm(cert.fingerprint256 ?? '') !== pin) {
-                    sock.destroy();
-                    oncreate(new Error('certificate-pin'));
-                    return;
+    // our own TLS socket for every https connection, handed to the request only after the handshake
+    // and the trust check - nothing, the credential least of all, is written to a server whose
+    // certificate is refused. Node's own path would skip checkServerIdentity when the chain does
+    // not verify and drop the socket before anything about the certificate can be read; here the
+    // chain is verified with rejectUnauthorized: false and judged by hand, so the leaf, the chain
+    // and the CA are in the error the consumer shows.
+    const pin = trust?.fingerprint256 ? norm(trust.fingerprint256) : '';
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    o.createConnection = ((_opts: unknown, oncreate: (err: Error | null, s?: tls.TLSSocket) => void) => {
+        const sock = tls.connect({host, port: Number(url.port || 443), servername: net.isIP(host) ? undefined : host, rejectUnauthorized: false, ...(trust?.ca ? {ca: caList(trust.ca), allowPartialTrustChain: true} : {})});
+        sock.once('secureConnect', () => {
+            recordPeer(sock, seen);
+            let refused: string | undefined;
+            if (pin) {
+                if (norm(seen.fingerprint ?? '') !== pin) refused = 'pin';
+            } else if (!trust?.insecure) {
+                if (!sock.authorized) {
+                    const e = sock.authorizationError as unknown;
+                    refused = e instanceof Error ? ((e as {code?: string}).code ?? e.message) : String(e || 'UNTRUSTED');
+                } else {
+                    // the identity: Node checks it only against servername/host; an IP address is checked here
+                    const id = tls.checkServerIdentity(host, sock.getPeerCertificate());
+                    if (id) refused = (id as {code?: string}).code ?? 'ERR_TLS_CERT_ALTNAME_INVALID';
                 }
-                oncreate(null, sock);
-            });
-            sock.once('error', (e) => oncreate(e));
-            return undefined;
-        }) as unknown as https.RequestOptions['createConnection'];
-        return o;
-    }
-    if (trust?.ca) o.ca = trust.ca;
-    o.checkServerIdentity = (host, cert) => {
-        record(cert);
-        return tls.checkServerIdentity(host, cert);
-    };
+            }
+            if (refused) {
+                sock.destroy();
+                oncreate(new CertRefused(refused));
+                return;
+            }
+            oncreate(null, sock);
+        });
+        sock.once('error', (e) => oncreate(e));
+        return undefined;
+    }) as unknown as https.RequestOptions['createConnection'];
     return o;
 }
 
 function certError(seen: Seen, e: Error): OccuLiteError {
-    return new OccuLiteError('certificate', e.message === 'certificate-pin' ? 'the system presents another certificate than the one pinned at pairing' : `the certificate is not trusted: ${e.message}`, {certificate: seen.cert});
+    const reason = e instanceof CertRefused ? e.reason : ((e as {code?: string}).code ?? e.message);
+    const what = reason === 'pin' ? 'the system presents another certificate than the one pinned at pairing' : `the certificate is not trusted (${reason})${seen.ca ? `: issued by ${seen.ca.subject ?? 'a CA'} - trust that CA, or pin the certificate` : seen.cert ? ': self-signed - pin its fingerprint (pairing does)' : ''}`;
+    return new OccuLiteError('certificate', what, {certificate: seen.cert, chain: seen.chain, ca: seen.ca, detail: {code: reason}});
 }
 
-function isCertError(e: NodeJS.ErrnoException): boolean {
-    return e.message === 'certificate-pin' || /certificate|self.signed|CERT_|UNABLE_TO_VERIFY/i.test(`${e.code ?? ''} ${e.message}`);
+function isCertError(e: Error): boolean {
+    return e instanceof CertRefused || /certificate|self.signed|CERT_|UNABLE_TO_VERIFY/i.test(`${(e as {code?: string}).code ?? ''} ${e.message}`);
 }
 
-/** The https transport with pinning; the seen certificate is recorded for pairing. */
-export function nodeTransport(trust?: Trust): Transport & {lastFingerprint(): string | undefined} {
-    let last: string | undefined;
+/** The https transport with pinning; the certificate seen is recorded for pairing and probe(). */
+export function nodeTransport(trust?: Trust): Transport & {lastFingerprint(): string | undefined; lastCertificate(): CertificateInfo | undefined; lastChain(): CertificateInfo[] | undefined; lastCA(): (CertificateInfo & {pem: string}) | undefined} {
+    let last: Seen = {};
     const send = (method: string, url: string, headers: Record<string, string>, body: string | undefined, signal?: AbortSignal) =>
         new Promise<http.IncomingMessage>((resolve, reject) => {
             const u = new URL(url);
             const seen: Seen = {};
             const mod = u.protocol === 'https:' ? https : http;
             const req = mod.request(options(u, trust, {...headers, ...(body ? {'Content-Length': String(Buffer.byteLength(body))} : {})}, method, seen, signal), (res) => {
-                const sock = res.socket as TLSSocket;
-                const peer = typeof sock.getPeerX509Certificate === 'function' ? sock.getPeerX509Certificate() : undefined;
-                last = peer ? peer.fingerprint256 : seen.fingerprint;
+                if (u.protocol === 'https:') {
+                    if (!seen.cert) recordPeer(res.socket as TLSSocket, seen); // a reused socket: the handshake was another request's
+                    last = seen;
+                }
                 resolve(res);
             });
             req.on('error', (e: NodeJS.ErrnoException) => {
@@ -106,7 +174,10 @@ export function nodeTransport(trust?: Trust): Transport & {lastFingerprint(): st
             req.end();
         });
     return {
-        lastFingerprint: () => last,
+        lastFingerprint: () => last.fingerprint,
+        lastCertificate: () => last.cert,
+        lastChain: () => last.chain,
+        lastCA: () => last.ca,
         async request(method, url, headers, body, signal): Promise<TransportResponse> {
             const res = await send(method, url, headers, body, signal);
             const chunks: Buffer[] = [];
@@ -143,11 +214,18 @@ export interface ProbeResult {
     reason?: string;
     url: string;
     /** the version answer of an openccu-lite system */
-    info?: unknown;
+    info?: Info & {capabilities?: Capabilities};
     fingerprint256?: string;
-    /** the certificate a `certificate` reason is about */
+    /** the certificate the system showed (over https): the one a `certificate` reason is about,
+     *  or the one to pin - with `altNames` and `pem` */
     certificate?: CertificateInfo;
+    /** the chain it sent, the leaf first */
+    chain?: CertificateInfo[];
+    /** the topmost authority in that chain, with its PEM - for a *Trust the CA* offer; absent for a self-signed certificate */
+    ca?: CertificateInfo & {pem: string};
 }
+
+const certOf = (tx: ReturnType<typeof nodeTransport>) => ({fingerprint256: tx.lastFingerprint(), certificate: tx.lastCertificate(), chain: tx.lastChain(), ca: tx.lastCA()});
 
 /** What an address is: openccu-lite (and its version answer), a CCU (any other HTTP answer), or
  *  unreachable - with `reachable` and `reason` telling "still booting, try again" (timeout, refused)
@@ -163,7 +241,7 @@ export async function probe(address: string, opts: ProbeOptions = {}): Promise<P
             r = await tx.request('GET', `${url}/api/meta/v1/version`, {Accept: 'application/json'}, undefined, timeoutSignal(opts.timeout ?? 5000, opts.signal));
         } catch (e) {
             const err = e as OccuLiteError;
-            if (err.code === 'certificate') return {kind: 'unreachable', reachable: true, reason: 'certificate', url, certificate: err.certificate, fingerprint256: err.certificate?.fingerprint256};
+            if (err.code === 'certificate') return {kind: 'unreachable', reachable: true, reason: 'certificate', url, certificate: err.certificate, chain: err.chain, ca: err.ca, fingerprint256: err.certificate?.fingerprint256};
             return {kind: 'unreachable', reachable: false, reason: err.code === 'timeout' ? 'timeout' : err.code === 'aborted' ? 'aborted' : (err.reason ?? 'error'), url};
         }
         if ((r.status === 301 || r.status === 302 || r.status === 307 || r.status === 308) && r.headers.location) {
@@ -172,13 +250,13 @@ export async function probe(address: string, opts: ProbeOptions = {}): Promise<P
         }
         try {
             const j = JSON.parse(r.body);
-            if (r.status === 200 && j?.api === 'meta') return {kind: 'openccu-lite', reachable: true, url, info: j, fingerprint256: tx.lastFingerprint()};
+            if (r.status === 200 && j?.api === 'meta') return {kind: 'openccu-lite', reachable: true, url, info: j, ...certOf(tx)};
         } catch {
             /* HTML: a CCU's WebUI */
         }
-        return {kind: 'ccu', reachable: true, url, fingerprint256: tx.lastFingerprint()};
+        return {kind: 'ccu', reachable: true, url, ...certOf(tx)};
     }
-    return {kind: 'ccu', reachable: true, url, fingerprint256: tx.lastFingerprint()};
+    return {kind: 'ccu', reachable: true, url, ...certOf(tx)};
 }
 
 /** probe() again and again while the address is unreachable (a system still booting), with the

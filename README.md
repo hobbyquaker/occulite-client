@@ -55,6 +55,25 @@ its certificate, which is in `certificate`). **A timeout is never a CCU.** `prob
 probes again while the address is unreachable - 1, 2, 4, 8, then every 15 s by default - and resolves with the first
 answer.
 
+### Certificates and trust
+
+Over `https://` the Node transport judges the system's certificate itself, before anything - the credential least of
+all - is written: `trust: {fingerprint256}` accepts exactly the certificate pinned at pairing, `trust: {ca}` (PEM)
+trusts that authority beside Node's own store (an issuing CA alone is enough - a step-ca sends only its intermediate;
+the name must still fit the host), no `trust` means Node's store, and `{insecure: true}` is for pairing's first
+contact only. A refused certificate rejects `certificate` with everything a trust dialog shows: `certificate` (the
+leaf: `subject`, `issuer`, `fingerprint256`, `validFrom`, `validTo`, `altNames`, `pem`), `chain` (as the system sent
+it, the leaf first), **`ca`** (the topmost authority in that chain with its `pem` - what a *Trust the CA* button
+stores; absent for a self-signed certificate, which is pinned instead), and `reason` (`pin`, or Node's word:
+`DEPTH_ZERO_SELF_SIGNED_CERT`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `CERT_HAS_EXPIRED`,
+`ERR_TLS_CERT_ALTNAME_INVALID`, …). `probe()` returns the same three (`certificate`, `chain`, `ca`) for any `https`
+answer, so a settings dialog can offer the pin and the CA before the first connection.
+
+```js
+const r = await probe('https://192.168.1.20', {trust: {}})     // judge it, trust nothing yet
+if (r.reason === 'certificate') offer({pin: r.certificate.fingerprint256, ca: r.ca?.pem})
+```
+
 ## Connecting
 
 ```js
@@ -69,6 +88,7 @@ const box = new OccuLite({
 box.on('status', s => console.log(s.state))     // connecting | ready | degraded | offline | closed
 await box.ready({signal})                       // rejects unauthenticated | forbidden | unsupported | certificate | timeout | aborted
 
+box.devices.get('HmIP-RF.000A1B2C3D4E5F')           // DeviceDescription, as listDevices gives it
 box.interfaces                                      // [{name, protocol, url_path, running}] - live
 await box.listInterfaces()                          // the same from GET /api/rpc/v1/interfaces (needs rpc:read)
 box.values.get('HmIP-RF.000A1B2C3D4E5F:1.STATE')    // {value, ts, lc, confirmed, source}
@@ -86,6 +106,14 @@ await box.history('HmIP-RF.000A1B2C3D4E5F:1.ACTUAL_TEMPERATURE', {maxPoints: 288
 ```
 
 In a browser on the system itself, `auth: {session}` with the page's session, and the default `fetch` transport.
+
+**Typed shapes.** `box.devices` holds `DeviceDescription`s (the `listDevices` entry: `ADDRESS`, `TYPE`, `PARENT`,
+`CHILDREN`, `PARAMSETS`, `FIRMWARE`, `VERSION`, `FLAGS`, `RX_MODE`, `INTERFACE`, `ROAMING`, `RF_ADDRESS`,
+`AES_ACTIVE`, `LINK_SOURCE_ROLES`, `DIRECTION`, `GROUP`, `TEAM`, `INDEX`, `SUBTYPE`, … and an index signature for what a
+process adds), `paramsetDescription()` answers a `ParamsetDescription` (`ParamDescription` per key: `TYPE`,
+`OPERATIONS`, `FLAGS`, `DEFAULT`, `MIN`, `MAX`, `UNIT`, `ID`, `TAB_ORDER`, `CONTROL`, `SPECIAL`, `VALUE_LIST`), the
+service messages are `ServiceMessage`s - all exported from the package root, hand-written from the CCU's XML-RPC
+documentation. A list field (`CHILDREN`, `PARAMSETS`, `TEAM_CHANNELS`) is a string on some processes: guard it.
 
 **Every value, or the state store's.** `box.values` is filled from the system's state store at connect - but the
 store keeps only a chosen set of datapoints (what the system's own cards draw, and the service datapoints such as

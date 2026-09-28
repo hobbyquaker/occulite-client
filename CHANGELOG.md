@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Types:** `DeviceDescription` (the `listDevices` entry), `ParamsetDescription`/`ParamDescription`,
+  `ParamValue`, `SpecialValue`, `ServiceMessage`/`ServiceMessageView` exported from the root; `box.devices` is
+  `Map<string, DeviceDescription>`, `paramsetDescription()` answers a `ParamsetDescription`. `Info` gained `format` and a
+  typed `hmip`; `probe()`'s `info` is typed.
+- **Certificates:** over `https` the Node transport takes every connection over its own TLS socket and judges the
+  certificate by hand (Node's path dropped the socket before anything about an untrusted certificate could be read), so
+  a `certificate` error carries the leaf (`certificate`, now with `altNames`, `ca` and `pem`), the **`chain`** as sent
+  and the **`ca`** to offer - the topmost authority in the chain, with its PEM - and `reason` is `pin` or Node's code
+  (`DEPTH_ZERO_SELF_SIGNED_CERT`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `ERR_TLS_CERT_ALTNAME_INVALID`, …). `trust.ca`
+  is trusted beside Node's defaults (it replaced them before) and as a partial chain (an issuing CA alone). `probe()`
+  returns `certificate`, `chain` and `ca` for every `https` answer; `nodeTransport()` has `lastCertificate()`,
+  `lastChain()`, `lastCA()`; `describeCertificate()` and `toPEM()` are exported from `occulite-client/node`.
+  `npm run check` also compiles the tests and a consumer-shaped usage of the types (`tsconfig.test.json`).
+
 - The metadata API complete on `box.meta`: `objects.patch/put/delete/bulk/rename/assign`,
   `enums.create/update/delete/list`, `tree.create/update/delete`, `import(document, {mode})`, `export({format})` -
   every write answers `{revision, changed}` (a `304` as `changed: false`), takes `{ifMatch}` (→ `revision-conflict`),
