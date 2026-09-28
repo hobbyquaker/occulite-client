@@ -5,7 +5,7 @@
 // last event id, re-read after a resync, the batches of one multicall together. Requests go over
 // lite-rpc's JSON-RPC path, a FLOAT datapoint written as a typed double.
 
-import {OccuLiteError, httpError} from './errors.ts';
+import {OccuLiteError, abortError, httpError, timeoutSignal} from './errors.ts';
 import {MetaCopy, type MetaDocument, type MetaEvent} from './meta.ts';
 import {datapointRef, parseDatapointRef, parseRef, ref as mkRef} from './refs.ts';
 import {parseSSE} from './sse.ts';
@@ -43,6 +43,12 @@ export interface Options {
     reconnect?: {min: number; max: number};
     /** how long ready() waits for the device lists; default 30 s */
     readyTimeout?: number;
+    /** per request, ms; default 30 s. A request over it rejects with `timeout` (not `unreachable`) */
+    timeout?: number;
+    /** the whole connect - detection, credential, the first picture - before ready() rejects with `timeout`; default 60 s */
+    connectTimeout?: number;
+    /** silence on a stream (the system pings every 15 s) after which it is reopened; default 45 s */
+    streamTimeout?: number;
 }
 
 export interface Value {
@@ -183,11 +189,13 @@ export class OccuLite {
         return h;
     }
 
-    /** Any API call, the same errors; the escape hatch for what the client does not wrap. */
-    async request<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
+    /** Any API call, the same errors; the escape hatch for what the client does not wrap. A request
+     *  takes opts.timeout (default the client's) and a signal of the caller's; close() ends it too. */
+    async request<T = unknown>(method: string, path: string, body?: unknown, opts: {signal?: AbortSignal; timeout?: number} = {}): Promise<T> {
         this.inflight++;
         try {
-            const r = await this.tx.request(method, this.url + path, this.headers(body === undefined ? {} : {'Content-Type': 'application/json'}), body === undefined ? undefined : JSON.stringify(body));
+            const signal = timeoutSignal(opts.timeout ?? this.opts.timeout ?? 30000, this.abort.signal, opts.signal);
+            const r = await this.tx.request(method, this.url + path, this.headers(body === undefined ? {} : {'Content-Type': 'application/json'}), body === undefined ? undefined : JSON.stringify(body), signal);
             let parsed: unknown = undefined;
             if (r.body) {
                 try {
@@ -206,15 +214,32 @@ export class OccuLite {
     // ---- connect -----------------------------------------------------------------------------
 
     /** Connects and resolves once the first complete picture is loaded; rejects on a system that is
-     *  not openccu-lite, a refused credential, or an API major it does not speak. */
-    ready(): Promise<void> {
-        this.readyP ??= this.connect();
+     *  not openccu-lite, a refused credential, an API major it does not speak, `timeout` after
+     *  connectTimeout, or `aborted` when the signal fires (the client is closed then). */
+    ready(opts: {signal?: AbortSignal} = {}): Promise<void> {
+        this.readyP ??= this.connect(opts.signal);
         return this.readyP;
     }
 
-    private async connect(): Promise<void> {
+    private async connect(signal?: AbortSignal): Promise<void> {
+        const deadline = timeoutSignal(this.opts.connectTimeout ?? 60000, signal);
+        const onAbort = () => {
+            this.close();
+        };
+        deadline?.addEventListener('abort', onAbort, {once: true});
+        try {
+            await this.connectSteps(deadline);
+        } catch (e) {
+            if (deadline?.aborted) throw abortError(deadline, 'connecting');
+            throw e;
+        } finally {
+            deadline?.removeEventListener('abort', onAbort);
+        }
+    }
+
+    private async connectSteps(signal?: AbortSignal): Promise<void> {
         this.setStatus('connecting');
-        const v = await this.request<Info & {capabilities?: Capabilities}>('GET', '/api/meta/v1/version').catch((e: OccuLiteError) => {
+        const v = await this.request<Info & {capabilities?: Capabilities}>('GET', '/api/meta/v1/version', undefined, {signal}).catch((e: OccuLiteError) => {
             if (e.code === 'not-found' || e.status === 404) throw new OccuLiteError('unsupported', 'not an openccu-lite system (no /api/meta/v1/version)');
             throw e;
         });
@@ -225,29 +250,41 @@ export class OccuLite {
             const mine = (SPEAKS as Record<string, number>)[api];
             if (mine !== undefined && major > mine) throw new OccuLiteError('unsupported', `the system speaks ${api} API ${major}; this client speaks ${mine} - update occulite-client`);
         }
-        const st = await this.request<{scopes?: string[]; authenticated?: boolean}>('GET', '/api/auth/v1/state').catch(() => ({scopes: []}));
+        const st = await this.request<{scopes?: string[]; authenticated?: boolean}>('GET', '/api/auth/v1/state', undefined, {signal}).catch((e: OccuLiteError) => {
+            if (signal?.aborted) throw e;
+            return {scopes: []};
+        });
         this.scopes = st.scopes ?? [];
-        await this.loadInterfaces();
-        await Promise.all([this.opts.values === false ? undefined : this.loadValues(), this.opts.meta === false ? undefined : this.loadMeta()]);
+        await this.loadInterfaces(signal);
+        await Promise.all([this.opts.values === false ? undefined : this.loadValues(signal), this.opts.meta === false ? undefined : this.loadMeta(signal)]);
+        if (signal?.aborted) throw abortError(signal, 'connecting');
         const devicesDone = this.opts.devices === false ? Promise.resolve() : new Promise<void>((res) => (this.devicesWaiter = res));
         void this.runStream();
         if (this.opts.meta !== false) void this.runMetaStream();
-        await Promise.race([devicesDone, new Promise<void>((res) => setTimeout(res, this.opts.readyTimeout ?? 30000))]);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const gaveUp = new Promise<void>((res) => (timer = setTimeout(res, this.opts.readyTimeout ?? 30000)));
+        const aborted = new Promise<void>((res) => signal?.addEventListener('abort', () => res(), {once: true}));
+        try {
+            await Promise.race([devicesDone, gaveUp, aborted]);
+        } finally {
+            clearTimeout(timer);
+        }
+        if (signal?.aborted) throw abortError(signal, 'connecting');
         this.setStatus('ready');
     }
 
     /** The interfaces this system runs, typed: GET /api/rpc/v1/interfaces (needs rpc:read). */
-    listInterfaces(): Promise<InterfaceInfo[]> {
-        return this.request<InterfaceInfo[]>('GET', '/api/rpc/v1/interfaces').then((l) => (Array.isArray(l) ? l.map((i) => ({...i, running: i.running !== false})) : []));
+    listInterfaces(opts: {signal?: AbortSignal} = {}): Promise<InterfaceInfo[]> {
+        return this.request<InterfaceInfo[]>('GET', '/api/rpc/v1/interfaces', undefined, opts).then((l) => (Array.isArray(l) ? l.map((i) => ({...i, running: i.running !== false})) : []));
     }
 
     /** The interfaces to follow: the system's list narrowed to opts.interfaces. A credential
      *  without rpc:read (403) or a system without the route (404) is no failure: the consumer's
      *  list stands as a guess, and the stream's hello names the rest. */
-    private async loadInterfaces(): Promise<void> {
+    private async loadInterfaces(signal?: AbortSignal): Promise<void> {
         const wanted = this.opts.interfaces;
         try {
-            const list = await this.listInterfaces();
+            const list = await this.listInterfaces({signal});
             this.interfaces = wanted ? list.filter((i) => wanted.includes(i.name)) : list;
             this.interfacesListed = true;
         } catch (e) {
@@ -278,7 +315,7 @@ export class OccuLite {
         this.setStatus('closed');
     }
 
-    private async loadValues(): Promise<void> {
+    private async loadValues(signal?: AbortSignal): Promise<void> {
         if (!this.capabilities.state) return;
         let after = '';
         let eventId = '';
@@ -286,7 +323,7 @@ export class OccuLite {
             const q = new URLSearchParams({limit: '5000'});
             for (const i of this.interfaceNames()) q.append('interface', i);
             if (after) q.set('after', after);
-            const r = await this.request<{entries: any[]; next?: string; event_id?: string}>('GET', `/api/rpc/v1/state?${q}`);
+            const r = await this.request<{entries: any[]; next?: string; event_id?: string}>('GET', `/api/rpc/v1/state?${q}`, undefined, {signal});
             if (page === 0) eventId = r.event_id ?? '';
             for (const e of r.entries) this.values.set(datapointRef(e.interface, e.address, e.datapoint), {value: e.value, ts: ms(e.ts) ?? 0, lc: ms(e.lc), confirmed: !!e.confirmed});
             if (!r.next) break;
@@ -296,9 +333,45 @@ export class OccuLite {
         if (eventId && !this.lastEventId) this.lastEventId = eventId;
     }
 
-    private async loadMeta(): Promise<void> {
-        const doc = await this.request<MetaDocument>('GET', '/api/meta/v1/snapshot').catch(() => undefined);
+    private async loadMeta(signal?: AbortSignal): Promise<void> {
+        const doc = await this.request<MetaDocument>('GET', '/api/meta/v1/snapshot', undefined, {signal}).catch(() => undefined);
         if (doc) this.meta.load(doc);
+    }
+
+    /** Opens a stream with a silence watchdog: no message or ping for streamTimeout ends it, and
+     *  the caller reopens. The stream ends with close() too. */
+    private async openStream(url: string, headers: Record<string, string>): Promise<{status: number; body?: string; messages: AsyncGenerator<import('./sse.ts').SSEMessage>}> {
+        const sc = new AbortController();
+        const signal = AbortSignal.any([this.abort.signal, sc.signal]);
+        const silence = this.opts.streamTimeout ?? 45000;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const kick = () => {
+            clearTimeout(timer);
+            timer = setTimeout(() => sc.abort(new OccuLiteError('timeout', `no message for ${silence} ms`, {detail: {code: 'timeout'}})), silence);
+        };
+        kick();
+        let s: Awaited<ReturnType<Transport['stream']>>;
+        try {
+            s = await this.tx.stream(url, headers, signal);
+        } catch (e) {
+            clearTimeout(timer);
+            throw sc.signal.aborted ? new OccuLiteError('timeout', 'the stream did not open in time', {detail: {code: 'timeout'}}) : e;
+        }
+        const parsed = parseSSE(s.chunks, kick);
+        const self = this;
+        async function* messages() {
+            try {
+                for await (const m of parsed) {
+                    kick();
+                    yield m;
+                }
+                if (sc.signal.aborted && !self.abort.signal.aborted) throw sc.signal.reason;
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+        if (s.status !== 200) clearTimeout(timer);
+        return {status: s.status, body: s.body, messages: messages()};
     }
 
     // ---- the RPC event stream ------------------------------------------------------------------
@@ -306,15 +379,15 @@ export class OccuLite {
     private async runStream(): Promise<void> {
         let delay = this.opts.reconnect?.min ?? 1000;
         const maxDelay = this.opts.reconnect?.max ?? 30000;
-        let firstDevices = this.opts.devices !== false;
         while (!this.abort.signal.aborted) {
             const q = new URLSearchParams();
             for (const i of this.interfaceNames()) q.append('interface', i);
-            if (firstDevices) q.set('devices', '1');
+            // the device lists with the stream while ready() still waits for them (a dropped stream asks again)
+            if (this.opts.devices !== false && this.devicesWaiter) q.set('devices', '1');
             const h = this.headers();
             if (this.lastEventId) h['Last-Event-ID'] = this.lastEventId;
             try {
-                const s = await this.tx.stream(`${this.url}/api/rpc/v1/events?${q}`, h, this.abort.signal);
+                const s = await this.openStream(`${this.url}/api/rpc/v1/events?${q}`, h);
                 if (s.status !== 200) {
                     let body: unknown = s.body;
                     try {
@@ -331,11 +404,10 @@ export class OccuLite {
                     throw err;
                 }
                 delay = this.opts.reconnect?.min ?? 1000;
-                for await (const m of parseSSE(s.chunks)) {
+                for await (const m of s.messages) {
                     if (m.id) this.lastEventId = m.id;
                     this.handle(m.event, m.data);
                 }
-                firstDevices = false;
             } catch (e) {
                 if (this.abort.signal.aborted) return;
                 this.opts.log?.warn?.(`occulite-client: the event stream ended: ${(e as Error).message}`);
@@ -455,11 +527,11 @@ export class OccuLite {
         let delay = this.opts.reconnect?.min ?? 1000;
         while (!this.abort.signal.aborted) {
             try {
-                const s = await this.tx.stream(`${this.url}/api/meta/v1/events/sse?since=${this.meta.revision}`, this.headers(), this.abort.signal);
+                const s = await this.openStream(`${this.url}/api/meta/v1/events/sse?since=${this.meta.revision}`, this.headers());
                 if (s.status === 401 || s.status === 403 || s.status === 404) return;
                 if (s.status === 200) {
                     delay = this.opts.reconnect?.min ?? 1000;
-                    for await (const m of parseSSE(s.chunks)) {
+                    for await (const m of s.messages) {
                         let ev: MetaEvent;
                         try {
                             ev = JSON.parse(m.data);
@@ -470,8 +542,9 @@ export class OccuLite {
                         this.emit('meta', ev);
                     }
                 }
-            } catch {
+            } catch (e) {
                 if (this.abort.signal.aborted) return;
+                this.opts.log?.warn?.(`occulite-client: the metadata stream ended: ${(e as Error).message}`);
             }
             await new Promise((res) => setTimeout(res, delay));
             delay = Math.min(delay * 2, this.opts.reconnect?.max ?? 30000);

@@ -36,6 +36,11 @@ export interface FakeBoxOptions {
     capabilities?: Record<string, unknown>;
     /** approve every pairing request as soon as the program revealed its half */
     autoApprove?: boolean;
+    /** accept connections and never answer (a system still booting); set it back to false and the
+     *  held requests are answered */
+    hang?: boolean;
+    /** send the stream's `: ping` comment every n ms (default: none; the system does every 15 s) */
+    pingInterval?: number;
 }
 
 interface Stream {
@@ -53,13 +58,31 @@ export class FakeBox {
     private metaStreams = new Set<http.ServerResponse>();
     private seq = 0;
     private ring: {seq: number; event: string; data: unknown}[] = [];
+    /** how often a stream was opened (reconnects counted) */
+    streamsOpened = 0;
+    private held = new Set<{req: http.IncomingMessage; res: http.ServerResponse}>();
     readonly pairings = new Map<string, {poll: string; nonce: Buffer; commit: string; clientNonce?: Buffer; state: string; token?: string; access: unknown; app: string}>();
 
     readonly opts: FakeBoxOptions;
 
     constructor(opts: FakeBoxOptions = {}) {
         this.opts = opts;
-        this.server = http.createServer((req, res) => void this.handle(req, res));
+        this.server = http.createServer((req, res) => {
+            if (this.opts.hang) {
+                const h = {req, res};
+                this.held.add(h);
+                req.on('close', () => this.held.delete(h));
+                return;
+            }
+            void this.handle(req, res);
+        });
+    }
+
+    /** Stops hanging: the requests held so far are answered. */
+    resume(): void {
+        this.opts.hang = false;
+        for (const h of this.held) void this.handle(h.req, h.res);
+        this.held.clear();
     }
 
     async start(): Promise<string> {
@@ -69,6 +92,8 @@ export class FakeBox {
     }
 
     async stop(): Promise<void> {
+        for (const h of this.held) h.res.destroy();
+        this.held.clear();
         for (const s of this.streams) s.res.end();
         for (const r of this.metaStreams) r.end();
         this.server.closeAllConnections();
@@ -204,6 +229,11 @@ export class FakeBox {
                 p.clientNonce = b;
                 if (this.opts.autoApprove) this.approve(pm[1]);
             }
+            // the long poll: the answer waits for a change of state up to wait= seconds (the system's 30)
+            const wait = Math.min(Number(u.searchParams.get('wait') ?? 0), 30) * 1000;
+            const end = Date.now() + wait;
+            while (p.state === 'pending' && Date.now() < end && !res.closed) await new Promise((r) => setTimeout(r, 20));
+            if (res.closed) return;
             if (p.state === 'approved') {
                 this.pairings.delete(pm[1]);
                 return this.json(res, 200, {state: 'approved', token: p.token, name: `${p.app}-fake`, scopes: ['rpc:read'], access: p.access});
@@ -245,8 +275,13 @@ export class FakeBox {
             return this.json(res, 200, [[Date.parse('2026-09-25T00:00:00Z'), 21.5], [Date.parse('2026-09-25T00:10:00Z'), 21.7]]);
         }
         if (key === 'GET /api/rpc/v1/events') {
+            this.streamsOpened++;
             res.writeHead(200, {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store'});
             res.write(': connected\n\n');
+            if (this.opts.pingInterval) {
+                const t = setInterval(() => res.write(': ping\n\n'), this.opts.pingInterval);
+                req.on('close', () => clearInterval(t));
+            }
             const s: Stream = {res, interfaces: u.searchParams.getAll('interface')};
             this.send(res, `${this.bootId}-${this.seq}`, 'hello', {boot_id: this.bootId, seq: this.seq, interfaces: this.ifaceList().map((i) => ({name: i.name, state: i.running ? 'up' : 'down'})), buffer: {seconds: 300, events: 5000}});
             const last = req.headers['last-event-id'];

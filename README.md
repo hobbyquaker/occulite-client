@@ -34,7 +34,26 @@ const paired = await pair({
 
 The levels: **devices** `read` · `operate` · `configure` · `administer` (may pair and delete devices), **names** (names
 and rooms) `read` · `configure`, **system** `read` · `configure`. The administrator approves exactly what was asked,
-or rejects it.
+or rejects it. `signal` withdraws the request (the promise rejects `aborted`); `timeout` (ms) withdraws it too and
+rejects `timeout` - the system itself lets a request expire after five minutes.
+
+## Detection
+
+```js
+import {probe, probeUntil} from 'occulite-client/node'
+
+const r = await probe('192.168.1.20', {timeout: 5000})
+// {kind: 'openccu-lite' | 'ccu' | 'unreachable', reachable, reason?, url, info?, fingerprint256?, certificate?}
+```
+
+`kind` is what answered: `openccu-lite` (with the version answer in `info` and the certificate's `fingerprint256`),
+`ccu` (any other HTTP answer, a WebUI's HTML included) or `unreachable`. **`reachable`** and **`reason`** tell the
+cases apart that every program used to lump together: `reachable: false` with `timeout` (the system accepts the
+connection and does not answer - still booting, or a Pi under load: try again) or `refused` (nothing listens there
+yet) or `dns`; `reachable: true` with `reason: 'certificate'` (the system is there and the `trust` you passed refuses
+its certificate, which is in `certificate`). **A timeout is never a CCU.** `probeUntil(address, {schedule, signal})`
+probes again while the address is unreachable - 1, 2, 4, 8, then every 15 s by default - and resolves with the first
+answer.
 
 ## Connecting
 
@@ -48,7 +67,7 @@ const box = new OccuLite({
   transport: nodeTransport({fingerprint256}),   // the certificate pinned at pairing
 })
 box.on('status', s => console.log(s.state))     // connecting | ready | degraded | offline | closed
-await box.ready()
+await box.ready({signal})                       // rejects unauthenticated | forbidden | unsupported | certificate | timeout | aborted
 
 box.interfaces                                      // [{name, protocol, url_path, running}] - live
 await box.listInterfaces()                          // the same from GET /api/rpc/v1/interfaces (needs rpc:read)
@@ -66,6 +85,12 @@ await box.history('HmIP-RF.000A1B2C3D4E5F:1.ACTUAL_TEMPERATURE', {maxPoints: 288
 ```
 
 In a browser on the system itself, `auth: {session}` with the page's session, and the default `fetch` transport.
+
+**Timeouts.** Every request has one - `timeout` (default 30 s; `box.request(…, {timeout, signal})` per call) - and
+rejects `timeout`, never `unreachable`, when the system does not answer in time. `connectTimeout` (default 60 s)
+bounds the whole `ready()`; `readyTimeout` (default 30 s) is how long it waits for the device lists before it
+resolves anyway. A stream that is silent for `streamTimeout` (default 45 s; the system pings every 15 s) is
+reopened. Nothing the client starts keeps a Node process alive once `close()` was called.
 
 The interfaces the client follows come from `GET /api/rpc/v1/interfaces` - the names `InterfacesList.xml` has, as
 lite-rpc's paths take them - narrowed to `interfaces: [...]` when you pass one. The list stays behind `rpc:read` (it

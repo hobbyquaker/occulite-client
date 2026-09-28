@@ -1,6 +1,6 @@
 // One error class for everything the client reports: the API's own codes (unauthenticated,
 // forbidden, too-many-streams, unknown-interface, down, unsupported, the metadata codes) and the
-// client's (unreachable, timeout, certificate, rpc-fault, protocol).
+// client's (unreachable, timeout, aborted, certificate, rpc-fault, protocol).
 
 export interface CertificateInfo {
     subject?: string;
@@ -21,6 +21,12 @@ export class OccuLiteError extends Error {
     /** the certificate a `certificate` error is about - for the consumer's trust dialog */
     readonly certificate?: CertificateInfo;
     readonly detail?: unknown;
+
+    /** an `unreachable` error's cause: refused, dns, reset, timeout, or the OS error code */
+    get reason(): string | undefined {
+        const d = this.detail as {code?: string} | undefined;
+        return typeof d?.code === 'string' ? d.code : undefined;
+    }
 
     constructor(code: string, message: string, extra: {status?: number; scope?: string; faultCode?: number; method?: string; certificate?: CertificateInfo; detail?: unknown} = {}) {
         super(message);
@@ -48,4 +54,31 @@ export function httpError(status: number, body: unknown): OccuLiteError {
     if (code === 'forbidden' && scope) message += ` (the credential lacks ${scope}: pair again with more access, or grant it in the API tokens panel)`;
     if (code === 'not_found') code = 'not-found';
     return new OccuLiteError(code, message, {status, scope, detail: body});
+}
+
+/** The client's word for a transport error: refused, dns, reset, timeout, or the OS code as it is. */
+export function transportReason(e: {code?: string; message?: string; name?: string}): string {
+    const c = e.code ?? '';
+    if (c === 'ECONNREFUSED') return 'refused';
+    if (c === 'ENOTFOUND' || c === 'EAI_AGAIN' || c === 'EAI_NONAME') return 'dns';
+    if (c === 'ECONNRESET' || c === 'EPIPE') return 'reset';
+    if (c === 'ETIMEDOUT' || c === 'EHOSTUNREACH' || c === 'ENETUNREACH') return 'timeout';
+    if (e.name === 'TimeoutError') return 'timeout';
+    return c || 'error';
+}
+
+/** The error for an aborted request: `timeout` when the signal's reason is a timeout (AbortSignal.timeout()
+ *  or the client's own timer), else `aborted` (the consumer's signal). */
+export function abortError(signal: AbortSignal | undefined, what = 'the request'): OccuLiteError {
+    const r = signal?.reason as {name?: string; code?: string} | undefined;
+    if (r?.name === 'TimeoutError' || r?.code === 'timeout') return new OccuLiteError('timeout', `${what} timed out`, {detail: {code: 'timeout'}});
+    return new OccuLiteError('aborted', `${what} was aborted`, {detail: {code: 'aborted'}});
+}
+
+/** A signal that fires after ms (its reason a TimeoutError), combined with the others given. */
+export function timeoutSignal(ms: number | undefined, ...others: (AbortSignal | undefined)[]): AbortSignal | undefined {
+    const list = others.filter((s): s is AbortSignal => !!s);
+    if (ms && ms > 0) list.push(AbortSignal.timeout(ms));
+    if (!list.length) return undefined;
+    return list.length === 1 ? list[0] : AbortSignal.any(list);
 }

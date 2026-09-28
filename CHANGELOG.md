@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Timeouts everywhere: `timeout` per request (default 30 s; `request(…, {timeout, signal})` per call),
+  `connectTimeout` for the whole `ready()`, `ready({signal})`; a request the system does not answer rejects
+  `timeout`, an aborted one `aborted` - both distinct from `unreachable`. A stream silent for `streamTimeout`
+  (default 45 s) is reopened. `ready()`'s device-list timer is cleared, so a closed client no longer holds the
+  process for 30 s.
+- `probe(address, {timeout = 5000, signal, trust})` answers `reachable` and `reason` (`timeout`, `refused`, `dns`,
+  `certificate`, `aborted`) beside `kind` - a timeout is never a CCU - and `probeUntil()` retries while unreachable
+  with the 1/2/4/8/15 s schedule. `OccuLiteError.reason` names a transport error's cause.
+- `pair({timeout, signal})`: an overall timeout withdraws the request and rejects `timeout`; every poll has its own
+  limit; a request left on the way out is withdrawn.
+- `FakeBox`: `hang` (accept, never answer) with `resume()`, `pingInterval`, `streamsOpened`, and the pairing poll
+  honours `wait=`.
+
 - `box.interfaces` is the typed list from `GET /api/rpc/v1/interfaces` - `[{name, protocol, url_path, running}]`,
   narrowed to the `interfaces` option - and stays live from the stream's `hello` and `interface` events;
   `box.listInterfaces()` reads the route. A credential without `rpc:read` (403) or a system without the route (404)

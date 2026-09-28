@@ -9,7 +9,7 @@ import * as net from 'node:net';
 import * as tls from 'node:tls';
 import type {TLSSocket} from 'node:tls';
 import {REQUEST_HEADER} from '../client.ts';
-import {OccuLiteError, httpError, type CertificateInfo} from '../errors.ts';
+import {OccuLiteError, abortError, httpError, timeoutSignal, transportReason, type CertificateInfo} from '../errors.ts';
 import type {Transport, TransportResponse} from '../transport.ts';
 
 export interface Trust {
@@ -95,9 +95,9 @@ export function nodeTransport(trust?: Trust): Transport & {lastFingerprint(): st
                 resolve(res);
             });
             req.on('error', (e: NodeJS.ErrnoException) => {
-                if (e.name === 'AbortError') reject(new OccuLiteError('timeout', 'the request was aborted'));
+                if (e.name === 'AbortError' || e.code === 'ABORT_ERR') reject(abortError(signal));
                 else if (isCertError(e)) reject(certError(seen, e));
-                else reject(new OccuLiteError('unreachable', `the system does not answer: ${e.message}`));
+                else reject(new OccuLiteError('unreachable', `the system does not answer: ${e.message}`, {detail: {code: transportReason(e)}}));
             });
             if (body) req.write(body);
             req.end();
@@ -124,18 +124,44 @@ export function nodeTransport(trust?: Trust): Transport & {lastFingerprint(): st
     };
 }
 
-/** What an address is: openccu-lite (and its version answer), a CCU, or unreachable. Follows one
- *  redirect to https and records the certificate it saw. */
-export async function probe(address: string, opts: {trust?: Trust} = {}): Promise<{kind: 'openccu-lite' | 'ccu' | 'unreachable'; url: string; info?: unknown; fingerprint256?: string}> {
+export interface ProbeOptions {
+    trust?: Trust;
+    /** per request, ms; default 5 s. A system that accepts the connection and does not answer is `unreachable` with reason `timeout` - never a CCU */
+    timeout?: number;
+    signal?: AbortSignal;
+}
+
+export interface ProbeResult {
+    kind: 'openccu-lite' | 'ccu' | 'unreachable';
+    /** true for any HTTP answer (a CCU's HTML too) and for a certificate the trust refused (the system is there);
+     *  false for refused, timeout, dns */
+    reachable: boolean;
+    /** why it is unreachable: timeout, refused, dns, reset, certificate, aborted, or the OS error code */
+    reason?: string;
+    url: string;
+    /** the version answer of an openccu-lite system */
+    info?: unknown;
+    fingerprint256?: string;
+    /** the certificate a `certificate` reason is about */
+    certificate?: CertificateInfo;
+}
+
+/** What an address is: openccu-lite (and its version answer), a CCU (any other HTTP answer), or
+ *  unreachable - with `reachable` and `reason` telling "still booting, try again" (timeout, refused)
+ *  from "not there" (dns) and from a trust problem (certificate). Follows one redirect to https and
+ *  records the certificate it saw. */
+export async function probe(address: string, opts: ProbeOptions = {}): Promise<ProbeResult> {
     const base = /^https?:\/\//.test(address) ? address.replace(/\/+$/, '') : `http://${address}`;
     const tx = nodeTransport(opts.trust ?? {insecure: true});
     let url = base;
     for (let hop = 0; hop < 2; hop++) {
         let r: TransportResponse;
         try {
-            r = await tx.request('GET', `${url}/api/meta/v1/version`, {Accept: 'application/json'});
-        } catch {
-            return {kind: 'unreachable', url};
+            r = await tx.request('GET', `${url}/api/meta/v1/version`, {Accept: 'application/json'}, undefined, timeoutSignal(opts.timeout ?? 5000, opts.signal));
+        } catch (e) {
+            const err = e as OccuLiteError;
+            if (err.code === 'certificate') return {kind: 'unreachable', reachable: true, reason: 'certificate', url, certificate: err.certificate, fingerprint256: err.certificate?.fingerprint256};
+            return {kind: 'unreachable', reachable: false, reason: err.code === 'timeout' ? 'timeout' : err.code === 'aborted' ? 'aborted' : (err.reason ?? 'error'), url};
         }
         if ((r.status === 301 || r.status === 302 || r.status === 307 || r.status === 308) && r.headers.location) {
             url = new URL(r.headers.location, url).origin;
@@ -143,13 +169,36 @@ export async function probe(address: string, opts: {trust?: Trust} = {}): Promis
         }
         try {
             const j = JSON.parse(r.body);
-            if (r.status === 200 && j?.api === 'meta') return {kind: 'openccu-lite', url, info: j, fingerprint256: tx.lastFingerprint()};
+            if (r.status === 200 && j?.api === 'meta') return {kind: 'openccu-lite', reachable: true, url, info: j, fingerprint256: tx.lastFingerprint()};
         } catch {
             /* HTML: a CCU's WebUI */
         }
-        return {kind: 'ccu', url};
+        return {kind: 'ccu', reachable: true, url, fingerprint256: tx.lastFingerprint()};
     }
-    return {kind: 'ccu', url};
+    return {kind: 'ccu', reachable: true, url, fingerprint256: tx.lastFingerprint()};
+}
+
+/** probe() again and again while the address is unreachable (a system still booting), with the
+ *  consumers' schedule - 1, 2, 4, 8, then every 15 s - until an answer comes; a certificate
+ *  problem is an answer too. Rejects `aborted` when the signal fires. */
+export async function probeUntil(address: string, opts: ProbeOptions & {schedule?: number[]} = {}): Promise<ProbeResult> {
+    const schedule = opts.schedule ?? [1000, 2000, 4000, 8000, 15000];
+    for (let attempt = 0; ; attempt++) {
+        if (opts.signal?.aborted) throw new OccuLiteError('aborted', 'probing was aborted');
+        const r = await probe(address, opts);
+        if (r.reachable) return r;
+        if (r.reason === 'aborted' || opts.signal?.aborted) throw new OccuLiteError('aborted', 'probing was aborted');
+        const wait = schedule[Math.min(attempt, schedule.length - 1)];
+        await new Promise<void>((res) => {
+            const t = setTimeout(done, wait);
+            function done() {
+                clearTimeout(t);
+                opts.signal?.removeEventListener('abort', done);
+                res();
+            }
+            opts.signal?.addEventListener('abort', done, {once: true});
+        });
+    }
 }
 
 export interface PairOptions {
@@ -163,7 +212,11 @@ export interface PairOptions {
     purpose?: {devices?: string; names?: string; system?: string};
     /** called with the code to show the user, once the system has it */
     onCode: (code: string) => void;
+    /** abort = withdraw the request; the promise rejects `aborted` */
     signal?: AbortSignal;
+    /** an overall limit, ms: after it the request is withdrawn and the promise rejects `timeout`
+     *  (the system itself lets a request expire after five minutes) */
+    timeout?: number;
     /** the certificate to trust; default: any, for this first contact only (the fingerprint returned is the one to pin) */
     trust?: Trust;
 }
@@ -188,10 +241,15 @@ export function pairingCode(nonce: Buffer, clientNonce: Buffer, fingerprint: Buf
 export async function pair(o: PairOptions): Promise<Paired> {
     const url = o.url.replace(/\/+$/, '');
     const tx = nodeTransport(o.trust ?? {insecure: true});
+    // the whole pairing: the consumer's signal and the overall timeout; each request gets its own limit too
+    const signal = timeoutSignal(o.timeout, o.signal);
+    const per = (ms: number) => timeoutSignal(ms, signal);
     const clientNonce = randomBytes(16);
     const commit = createHash('sha256').update(clientNonce).digest('hex');
     const body = JSON.stringify({app: o.app, app_version: o.appVersion, instance: o.instance, name: o.name, access: o.access, purpose: o.purpose, commit});
-    const r = await tx.request('POST', `${url}/api/auth/v1/pairing/request`, {'Content-Type': 'application/json', [REQUEST_HEADER]: '1'}, body, o.signal);
+    const r = await tx.request('POST', `${url}/api/auth/v1/pairing/request`, {'Content-Type': 'application/json', [REQUEST_HEADER]: '1'}, body, per(15000)).catch((e: OccuLiteError) => {
+        throw signal?.aborted ? abortError(signal, 'pairing') : e;
+    });
     const ans = JSON.parse(r.body || '{}');
     if (r.status !== 202) throw httpError(r.status, ans);
     const seen = url.startsWith('https:') ? tx.lastFingerprint() ?? '' : '';
@@ -199,13 +257,18 @@ export async function pair(o: PairOptions): Promise<Paired> {
     const auth = {Authorization: `Pairing ${ans.poll}`, [REQUEST_HEADER]: '1'};
     const pollURL = `${url}/api/auth/v1/pairing/request/${encodeURIComponent(ans.id)}`;
     let first = true;
-    const withdraw = () => void tx.request('DELETE', pollURL, auth).catch(() => {});
-    o.signal?.addEventListener('abort', withdraw, {once: true});
+    // an abort or the timeout withdraws the request on the system (its own request limit, no signal)
+    const withdraw = () => void tx.request('DELETE', pollURL, auth, undefined, timeoutSignal(10000)).catch(() => {});
+    signal?.addEventListener('abort', withdraw, {once: true});
+    let settled = false; // the system answered approved, rejected or expired: nothing to withdraw
     try {
         for (;;) {
-            if (o.signal?.aborted) throw new OccuLiteError('aborted', 'pairing was cancelled');
+            if (signal?.aborted) throw abortError(signal, 'pairing');
             const q = first ? `?client_nonce=${clientNonce.toString('hex')}&wait=0` : '?wait=30';
-            const p = await tx.request('GET', pollURL + q, auth, undefined, o.signal);
+            // the long poll answers within 30 s; 45 s catches a connection that went half-open
+            const p = await tx.request('GET', pollURL + q, auth, undefined, per(first ? 15000 : 45000)).catch((e: OccuLiteError) => {
+                throw signal?.aborted ? abortError(signal, 'pairing') : e;
+            });
             const j = JSON.parse(p.body || '{}');
             if (p.status === 429) {
                 await new Promise((res) => setTimeout(res, 2000));
@@ -216,11 +279,14 @@ export async function pair(o: PairOptions): Promise<Paired> {
                 first = false;
                 o.onCode(code);
             }
+            if (j.state === 'approved' || j.state === 'rejected' || j.state === 'expired') settled = true;
             if (j.state === 'approved') return {token: j.token, name: j.name, scopes: j.scopes ?? [], access: j.access ?? {}, fingerprint256: seen};
             if (j.state === 'rejected') throw new OccuLiteError('rejected', 'the administrator rejected the request (or picked another code)');
             if (j.state === 'expired') throw new OccuLiteError('expired', 'nobody approved the request within five minutes');
         }
     } finally {
-        o.signal?.removeEventListener('abort', withdraw);
+        signal?.removeEventListener('abort', withdraw);
+        // a per-request timeout or another error on the way out: the request is withdrawn too
+        if (!settled && !signal?.aborted) withdraw();
     }
 }

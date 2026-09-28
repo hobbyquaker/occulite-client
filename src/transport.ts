@@ -2,7 +2,7 @@
 // Node when no certificate is pinned) and node:https (occulite-client/node: pinning a self-signed
 // certificate per connection, which Node's fetch does not take without undici).
 
-import {OccuLiteError} from './errors.ts';
+import {OccuLiteError, abortError, transportReason} from './errors.ts';
 
 export interface TransportResponse {
     status: number;
@@ -24,8 +24,9 @@ export function fetchTransport(f: typeof fetch = globalThis.fetch): Transport {
             try {
                 r = await f(url, {method, headers, body, signal, credentials: 'same-origin'});
             } catch (e) {
-                if ((e as Error).name === 'AbortError') throw new OccuLiteError('timeout', 'the request was aborted');
-                throw new OccuLiteError('unreachable', `the system does not answer: ${(e as Error).message}`);
+                if ((e as Error).name === 'AbortError' || (e as Error).name === 'TimeoutError') throw abortError(signal);
+                const cause = ((e as Error & {cause?: unknown}).cause ?? e) as {code?: string; message?: string; name?: string};
+                throw new OccuLiteError('unreachable', `the system does not answer: ${(e as Error).message}`, {detail: {code: transportReason(cause)}});
             }
             const h: Record<string, string> = {};
             r.headers.forEach((v, k) => (h[k.toLowerCase()] = v));
@@ -36,7 +37,9 @@ export function fetchTransport(f: typeof fetch = globalThis.fetch): Transport {
             try {
                 r = await f(url, {headers: {...headers, Accept: 'text/event-stream'}, signal, credentials: 'same-origin'});
             } catch (e) {
-                throw new OccuLiteError('unreachable', `the system does not answer: ${(e as Error).message}`);
+                if ((e as Error).name === 'AbortError' || (e as Error).name === 'TimeoutError') throw abortError(signal, 'the stream');
+                const cause = ((e as Error & {cause?: unknown}).cause ?? e) as {code?: string; message?: string; name?: string};
+                throw new OccuLiteError('unreachable', `the system does not answer: ${(e as Error).message}`, {detail: {code: transportReason(cause)}});
             }
             if (r.status !== 200 || !r.body) return {status: r.status, chunks: (async function* () {})(), body: await r.text()};
             const reader = r.body.getReader();
