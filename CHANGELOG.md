@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 / 2026-09-29
+
+What the consumers' ports need (hm2mqtt.js, node-red-contrib-ccu, matterbridge-homematic, homematic-manager): timeouts
+and credentials that work unattended, interfaces that come late, every value, a description cache, the metadata API
+complete, the system API's slice, typed descriptions and certificates, and the porting guide `docs/porting.md`.
+
+### Breaking changes against 0.1.0
+
+- `box.interfaces` is `InterfaceInfo[]` (`{name, protocol, url_path, running}`), no longer `string[]`; the names are
+  `box.interfaces.map((i) => i.name)`.
+- `box.meta.membership(ref, opts)` answers the nodes (`{rooms: NodeRef[], functions: NodeRef[]}`, each
+  `{path, id, name, depth}`, most specific first, ancestors included), and its second argument is an options object
+  (`{inherit, lang}`) instead of a `lang` string. 0.1.0's names-only answer is `membershipNames(ref, opts)`.
+- `box.rename()` and `box.assign()` answer `{revision, changed}` (a `304` as `changed: false`).
+- `trust.ca` is trusted beside Node's default authorities, and as a partial chain; in 0.1.0 it replaced them.
+- Without an `interfaces` option, the event stream and the state read carry no interface filter (a later interface is
+  followed); `ready()` waits for the device lists of running interfaces only.
+- Requests time out (`timeout`, default 30 s; `probe()` 5 s): a system that accepts a connection and does not answer
+  rejects `timeout`, or is `unreachable` with `reason: 'timeout'` for `probe()`, where 0.1.0 waited without end; an
+  aborted request rejects `aborted`.
+- Every request carries `X-Occulite-Request: 1` (openccu-lite refuses a cookie-only write without it).
+
+### Changes
 
 - **`docs/porting.md` complete:** the worked example (hm2mqtt.js's structure before and after its port, `backend/lite.js`
   in outline), *`box.values` is not every datapoint* and the sweep (the draft's *no sweep at start* row was wrong),
