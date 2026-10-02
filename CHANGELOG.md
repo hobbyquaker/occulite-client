@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 / 2026-10-02
 
 - `httpError(status, body)` and `abortError(signal, what)` are exported from the package root: an adapter maps and
   tests the client's errors without building `OccuLiteError`s by hand.
