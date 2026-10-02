@@ -331,7 +331,9 @@ export class OccuLite {
     // ---- HTTP --------------------------------------------------------------------------------
 
     private headers(extra: Record<string, string> = {}): Record<string, string> {
-        const h: Record<string, string> = {[REQUEST_HEADER]: '1', ...extra};
+        // every endpoint answers JSON; saying so keeps a proxy in front of the system from answering HTML.
+        // The stream calls replace it with text/event-stream in the transport
+        const h: Record<string, string> = {[REQUEST_HEADER]: '1', Accept: 'application/json', ...extra};
         if (this.auth.token) h.Authorization = `Bearer ${this.auth.token}`;
         else if (this.auth.session) h.Authorization = `Bearer ${this.auth.session}`;
         return h;

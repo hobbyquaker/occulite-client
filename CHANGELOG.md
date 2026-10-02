@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `httpError(status, body)` and `abortError(signal, what)` are exported from the package root: an adapter maps and
+  tests the client's errors without building `OccuLiteError`s by hand.
+- `FakeBox.dropMetaStreams()` ends the metadata change streams (a consumer's reconnect test reached into a private
+  field), `metaStreamsOpen` counts them.
+- Every request carries `Accept: application/json` (the streams `text/event-stream`, as before): a proxy in front of
+  the system that negotiates by it answers JSON, not HTML.
 ## 0.2.0 / 2026-09-29
 
 What the consumers' ports need (hm2mqtt.js, node-red-contrib-ccu, matterbridge-homematic, homematic-manager): timeouts

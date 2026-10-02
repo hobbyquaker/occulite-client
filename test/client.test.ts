@@ -286,3 +286,28 @@ test('interfaces: the typed list, running kept live, a token without rpc:read an
     assert.deepEqual(o2.interfaces, [{name: 'HmIP-RF', running: true}]);
     o2.close();
 });
+
+test('every request says Accept: application/json, the streams text/event-stream', async (t) => {
+    // a recording proxy in front of the fake: what a reverse proxy sees
+    const seen: {path: string; accept?: string}[] = [];
+    const target = new URL(box.url);
+    const proxy = http.createServer((req, res) => {
+        seen.push({path: req.url ?? '', accept: req.headers.accept});
+        const up = http.request({host: target.hostname, port: target.port, method: req.method, path: req.url, headers: req.headers}, (r) => {
+            res.writeHead(r.statusCode ?? 502, r.headers);
+            r.pipe(res);
+        });
+        req.pipe(up);
+    });
+    await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r));
+    t.after(() => {
+        proxy.closeAllConnections();
+        proxy.close();
+    });
+    const c = new OccuLite({url: `http://127.0.0.1:${(proxy.address() as {port: number}).port}`, auth: {token: box.opts.token!}, meta: false});
+    t.after(() => c.close());
+    await c.ready();
+    await c.request('GET', '/api/meta/v1/version');
+    await until(() => seen.some((r) => r.path.startsWith('/api/rpc/v1/events')) && seen.length >= 3);
+    for (const r of seen) assert.equal(r.accept, r.path.startsWith('/api/rpc/v1/events') ? 'text/event-stream' : 'application/json', r.path);
+});

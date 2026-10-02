@@ -154,3 +154,18 @@ test('a node.moved on the stream is applied in place, no new snapshot', async (t
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(snaps, 0);
 });
+
+test('dropMetaStreams ends the metadata change stream, and the client reopens it', async (t) => {
+    const box = new FakeBox({meta: structuredClone(HOUSE)});
+    await box.start();
+    t.after(() => box.stop());
+    const c = new OccuLite({url: box.url, values: false, devices: false});
+    t.after(() => c.close());
+    await c.ready();
+    await until(() => box.metaStreamsOpened === 1);
+    assert.equal(box.metaStreamsOpen, 1);
+    box.dropMetaStreams();
+    assert.equal(box.metaStreamsOpen, 0);
+    await until(() => box.metaStreamsOpened === 2, 5000);
+    await until(() => box.metaStreamsOpen === 1);
+});

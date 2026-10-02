@@ -239,6 +239,17 @@ export class FakeBox {
         this.streams.clear();
     }
 
+    /** Ends every metadata change stream, for a consumer's reconnect test (`metaStreamsOpened` counts the reopen). */
+    dropMetaStreams(): void {
+        for (const r of this.metaStreams) r.end();
+        this.metaStreams.clear();
+    }
+
+    /** How many metadata change streams are open now. */
+    get metaStreamsOpen(): number {
+        return this.metaStreams.size;
+    }
+
     /** The code of a pairing request, as the Status page shows it (plain HTTP: no fingerprint). */
     pairingCode(id: string): string {
         const p = this.pairings.get(id)!;

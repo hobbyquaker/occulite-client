@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {MetaCopy} from '../src/meta.ts';
+import {OccuLiteError, abortError, httpError} from '../src/index.ts';
 import {pairingCode} from '../src/node/index.ts';
 import {datapointRef, deviceOf, parseDatapointRef, parseRef, ref} from '../src/refs.ts';
 import {parseSSE} from '../src/sse.ts';
@@ -52,4 +53,19 @@ test('the metadata copy: events in place, a gap asks for a snapshot, the tree', 
     assert.deepEqual(m.membership('HmIP-RF.B:1', {lang: 'en'}).functions, [{path: 'function/licht', id: 'licht', name: 'Light', depth: 1}]);
     assert.deepEqual(m.membershipNames('HmIP-RF.B:1', {lang: 'de'}), {rooms: [], functions: ['Licht']});
     assert.deepEqual(m.channels().map((c) => c.ref), ['HmIP-RF.A:1', 'HmIP-RF.B:1']);
+});
+
+test('httpError and abortError are exported from the root, and build the client\'s errors', () => {
+    const forbidden = httpError(403, {error: 'forbidden', message: 'needs meta:write'});
+    assert.ok(forbidden instanceof OccuLiteError);
+    assert.equal(forbidden.code, 'forbidden');
+    assert.equal(forbidden.status, 403);
+    assert.equal(forbidden.scope, 'meta:write');
+    assert.equal(httpError(404, {}).code, 'not-found');
+    assert.equal(httpError(502, 'bad gateway').code, 'http-502');
+    assert.equal(abortError(undefined).code, 'aborted');
+    const ac = new AbortController();
+    ac.abort(new DOMException('late', 'TimeoutError'));
+    assert.equal(abortError(ac.signal, 'the sweep').code, 'timeout');
+    assert.equal(abortError(ac.signal, 'the sweep').message, 'the sweep timed out');
 });

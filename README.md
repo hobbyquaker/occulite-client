@@ -290,7 +290,11 @@ device list), `init`, `setReadyConfig`, `system.listMethods` - your handlers for
 
 `occulite-client/testing` ships `FakeBox`, a fake openccu-lite system in one Node http server (the version answer,
 lite-rpc's JSON path and stream, the state store, the metadata, pairing). The package's own tests run against it; so
-can yours.
+can yours: `box.event()` and `box.push()` put messages on the stream,
+`box.dropStreams()` and `box.dropMetaStreams()` end the event and the metadata change streams for a reconnect test
+(`streamsOpened`, `metaStreamsOpened` count the reopen), `box.calls` records the lite-rpc calls. The errors the client
+throws are `OccuLiteError`s; `httpError(status, body)` and `abortError(signal)` build the same ones, for an adapter's
+mapping and its tests.
 
 ```sh
 npm test
