@@ -271,7 +271,7 @@ server.on('event', (err, [initId, address, key, value], cb) => {})
 server.on('system.multicall', (err, [calls], cb) => {})           // calls: [{methodName: 'event', params: [...]}]
 server.on('newDevices', (err, [initId, descriptions], cb) => {})
 server.on('deleteDevices', (err, [initId, addresses], cb) => {})
-server.on('updateDevice', (err, [initId, address, hint], cb) => {})   // hint is 0: the stream carries none
+server.on('updateDevice', (err, [initId, address, hint], cb) => {})   // hint as the interface sent it: 0, 1 links, 2 description
 server.on('replaceDevice', (err, [initId, oldAddress, newAddress], cb) => {})
 server.on('readdedDevice', (err, [initId, addresses], cb) => {})
 server.on('interface', (err, [initId, iface, state], cb) => {})   // synthetic, with interfaceEvents: true
@@ -285,12 +285,15 @@ it tells a program that drove its per-interface status from `init`'s success whe
 `down`, `restarted`, `added`, `removed`). **Never emitted:** `listDevices` (the system does not ask a client for its
 device list), `init`, `setReadyConfig`, `system.listMethods` - your handlers for them stay for the CCU path.
 `newDevices` carries the descriptions, as on a CCU (the client fetches them when the stream names addresses only).
+`updateDevice`'s `hint` is the one the interface process sent (0 unspecified, 1 the links changed, 2 the description
+changed - read it again), from a system whose stream carries it; an older one gives 0. `replaceDevice`'s old and new
+address are the stream's `old`/`new`.
 
 ## Testing
 
 `occulite-client/testing` ships `FakeBox`, a fake openccu-lite system in one Node http server (the version answer,
 lite-rpc's JSON path and stream, the state store, the metadata, pairing). The package's own tests run against it; so
-can yours: `box.event()` and `box.push()` put messages on the stream,
+can yours: `box.event()`, `box.push()`, `box.updateDevice()`, `box.replaceDevice()` put messages on the stream,
 `box.dropStreams()` and `box.dropMetaStreams()` end the event and the metadata change streams for a reconnect test
 (`streamsOpened`, `metaStreamsOpened` count the reopen), `box.calls` records the lite-rpc calls. The errors the client
 throws are `OccuLiteError`s; `httpError(status, body)` and `abortError(signal)` build the same ones, for an adapter's

@@ -8,6 +8,12 @@
   field), `metaStreamsOpen` counts them.
 - Every request carries `Accept: application/json` (the streams `text/event-stream`, as before): a proxy in front of
   the system that negotiates by it answers JSON, not HTML.
+- The `callbacks` module passes `updateDevice`'s `hint` as the interface process sent it (0 unspecified, 1 the links
+  changed, 2 the description changed) and `replaceDevice`'s old and new address as the stream names them (`old`/`new`,
+  since openccu-lite's daemon carries them); from an older system the hint is 0 and the addresses keep their order. The
+  `devices` event carries `hint`, `old` and `new` (`DevicesEvent`, exported); `FakeBox.updateDevice()` and
+  `FakeBox.replaceDevice()` emit them.
+
 ## 0.2.0 / 2026-09-29
 
 What the consumers' ports need (hm2mqtt.js, node-red-contrib-ccu, matterbridge-homematic, homematic-manager): timeouts

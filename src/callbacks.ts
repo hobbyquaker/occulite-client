@@ -9,14 +9,15 @@
 //   system.multicall [[{methodName: 'event', params: [initId, address, key, value]}, ...]]
 //   newDevices       [initId, descriptions]           the descriptions, as listDevices gives them
 //   deleteDevices    [initId, addresses]
-//   updateDevice     [initId, address, hint]           hint is 0: the stream carries none (yet)
-//   replaceDevice    [initId, oldAddress, newAddress]
+//   updateDevice     [initId, address, hint]           hint as the interface sent it (0 unspecified, 1 links,
+//                                                     2 description); 0 from a system whose stream has none
+//   replaceDevice    [initId, oldAddress, newAddress]   the stream's old/new, else the addresses in order
 //   readdedDevice    [initId, addresses]
 //   interface        [initId, interface, state]        synthetic, only with interfaceEvents: true
 // Never emitted: listDevices (the system does not ask a client for its device list), init,
 // setReadyConfig, system.listMethods - a consumer's handlers for them stay for its CCU path.
 
-import type {OccuLite, ValueEvent} from './client.ts';
+import type {DevicesEvent, OccuLite, ValueEvent} from './client.ts';
 import {parseRef} from './refs.ts';
 
 type Callback = (err: Error | null, params: unknown[], cb: (err: unknown, res: unknown) => void) => void;
@@ -65,7 +66,7 @@ export function callbackEvents(box: OccuLite, opts: CallbackOptions = {}): Callb
         }),
     );
     offs.push(
-        box.on('devices', (ev: {kind: string; interface: string; refs: string[]; descriptions?: unknown[]}) => {
+        box.on('devices', (ev: DevicesEvent) => {
             const addrs = ev.refs.map((r) => parseRef(r).address);
             switch (ev.kind) {
                 case 'new':
@@ -75,10 +76,10 @@ export function callbackEvents(box: OccuLite, opts: CallbackOptions = {}): Callb
                     call('deleteDevices', [id(ev.interface), addrs]);
                     break;
                 case 'updated':
-                    call('updateDevice', [id(ev.interface), addrs[0], 0]);
+                    call('updateDevice', [id(ev.interface), addrs[0], ev.hint ?? 0]);
                     break;
                 case 'replaced':
-                    call('replaceDevice', [id(ev.interface), addrs[0], addrs[1]]);
+                    call('replaceDevice', [id(ev.interface), ev.old ?? addrs[0], ev.new ?? addrs[1]]);
                     break;
                 case 'readded':
                     call('readdedDevice', [id(ev.interface), addrs]);

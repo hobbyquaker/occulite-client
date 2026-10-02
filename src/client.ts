@@ -114,6 +114,19 @@ export interface ValueEvent extends Value {
     source?: string;
 }
 
+/** A `devices` event: a device list changed. `hint` on `updated` (0 unspecified, 1 the links changed, 2 the
+ *  description changed - read it again), `old`/`new` on `replaced`, as the stream names them; from a system that
+ *  does not, `hint` is 0 and `old`/`new` are the addresses in order. */
+export interface DevicesEvent {
+    kind: 'new' | 'deleted' | 'updated' | 'replaced' | 'readded';
+    interface: string;
+    refs: string[];
+    descriptions?: unknown[];
+    hint?: number;
+    old?: string;
+    new?: string;
+}
+
 /** One interface the system runs, as GET /api/rpc/v1/interfaces answers it (the names are the
  *  InterfacesList.xml names lite-rpc's paths take). */
 export interface InterfaceInfo {
@@ -759,7 +772,7 @@ export class OccuLite {
             case 'updateDevice':
             case 'replaceDevice':
             case 'readdedDevice': {
-                const kind = {newDevices: 'new', deleteDevices: 'deleted', updateDevice: 'updated', replaceDevice: 'replaced', readdedDevice: 'readded'}[event];
+                const kind = ({newDevices: 'new', deleteDevices: 'deleted', updateDevice: 'updated', replaceDevice: 'replaced', readdedDevice: 'readded'} as const)[event];
                 if (Array.isArray(d.devices)) {
                     for (const desc of d.devices) if (desc?.ADDRESS) this.devices.set(mkRef(d.interface, desc.ADDRESS), desc);
                     this.devicesSeen.add(d.interface);
@@ -781,7 +794,16 @@ export class OccuLite {
                         for (const k of [...this.devices.keys()]) if (k === mkRef(d.interface, a) || k.startsWith(mkRef(d.interface, a) + ':')) this.devices.delete(k);
                     }
                 }
-                this.emit('devices', {kind, interface: d.interface, refs: (d.addresses ?? (d.devices ?? []).map((x: any) => x.ADDRESS)).map((a: string) => mkRef(d.interface, a)), descriptions: d.devices});
+                const ev: DevicesEvent = {kind, interface: d.interface, refs: (d.addresses ?? (d.devices ?? []).map((x: any) => x.ADDRESS)).map((a: string) => mkRef(d.interface, a)), descriptions: d.devices};
+                // updateDevice's hint (0 unspecified, 1 the links changed, 2 the description changed) and
+                // replaceDevice's old/new, as the stream names them since occulited carries them; 0 and the
+                // addresses' order from an older system
+                if (event === 'updateDevice') ev.hint = typeof d.hint === 'number' ? d.hint : 0;
+                if (event === 'replaceDevice') {
+                    ev.old = typeof d.old === 'string' ? d.old : d.addresses?.[0];
+                    ev.new = typeof d.new === 'string' ? d.new : d.addresses?.[1];
+                }
+                this.emit('devices', ev);
                 break;
             }
             case 'resync':

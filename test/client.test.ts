@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import {after, before, test} from 'node:test';
 import {callbackEvents} from '../src/callbacks.ts';
-import {OccuLite, REQUEST_HEADER, type ValueEvent} from '../src/client.ts';
+import {OccuLite, REQUEST_HEADER, type DevicesEvent, type ValueEvent} from '../src/client.ts';
 import {OccuLiteError} from '../src/errors.ts';
 import {pair} from '../src/node/index.ts';
 import {FakeBox} from '../src/testing/fakebox.ts';
@@ -154,8 +154,8 @@ test('the callbacks module: initId as a function, the synthetic interface method
     assert.deepEqual(got.find(([, p]) => p[0] === 'nr_ab12cd_HmIP-RF')?.[1], ['nr_ab12cd_HmIP-RF', [{ADDRESS: 'H', TYPE: 'HmIP-PDT'}]]);
     b.event('BidCos-RF', 'JEQ0000001:1', 'STATE', true);
     b.push('deleteDevices', {interface: 'BidCos-RF', addresses: ['JEQ0000001', 'JEQ0000001:1']});
-    b.push('updateDevice', {interface: 'BidCos-RF', addresses: ['JEQ0000002']});
-    b.push('replaceDevice', {interface: 'BidCos-RF', addresses: ['JEQ0000003', 'JEQ0000004']});
+    b.updateDevice('BidCos-RF', 'JEQ0000002', 2);
+    b.replaceDevice('BidCos-RF', 'JEQ0000003', 'JEQ0000004');
     b.push('readdedDevice', {interface: 'BidCos-RF', addresses: ['JEQ0000005', 'JEQ0000005:1']});
     b.push('interface', {interface: 'BidCos-RF', state: 'down'});
     b.push('interface', {interface: 'BidCos-RF', state: 'up'});
@@ -163,7 +163,7 @@ test('the callbacks module: initId as a function, the synthetic interface method
     assert.deepEqual(got.slice(n), [
         ['event', ['nr_ab12cd_BidCos-RF', 'JEQ0000001:1', 'STATE', true]],
         ['deleteDevices', ['nr_ab12cd_BidCos-RF', ['JEQ0000001', 'JEQ0000001:1']]],
-        ['updateDevice', ['nr_ab12cd_BidCos-RF', 'JEQ0000002', 0]],
+        ['updateDevice', ['nr_ab12cd_BidCos-RF', 'JEQ0000002', 2]],
         ['replaceDevice', ['nr_ab12cd_BidCos-RF', 'JEQ0000003', 'JEQ0000004']],
         ['readdedDevice', ['nr_ab12cd_BidCos-RF', ['JEQ0000005', 'JEQ0000005:1']]],
         ['interface', ['nr_ab12cd_BidCos-RF', 'BidCos-RF', 'down']],
@@ -285,6 +285,41 @@ test('interfaces: the typed list, running kept live, a token without rpc:read an
     await o2.ready();
     assert.deepEqual(o2.interfaces, [{name: 'HmIP-RF', running: true}]);
     o2.close();
+});
+
+test('the devices event and the callbacks carry the hint and old/new; an older stream gives 0 and the order', async (t) => {
+    const b = new FakeBox({interfaces: ['BidCos-RF'], devices: {'BidCos-RF': []}});
+    await b.start();
+    t.after(() => b.stop());
+    const c = new OccuLite({url: b.url, values: false, meta: false});
+    t.after(() => c.close());
+    const events: DevicesEvent[] = [];
+    c.on('devices', (ev: DevicesEvent) => events.push(ev));
+    const srv = callbackEvents(c, {initId: 'x'});
+    const calls: unknown[][] = [];
+    srv.on('updateDevice', (_e, p) => calls.push(p));
+    srv.on('replaceDevice', (_e, p) => calls.push(p));
+    await c.ready();
+    b.updateDevice('BidCos-RF', 'JEQ0000001', 1);
+    b.replaceDevice('BidCos-RF', 'JEQ0000002', 'JEQ0000003');
+    // a system whose stream carries neither
+    b.push('updateDevice', {interface: 'BidCos-RF', addresses: ['JEQ0000004']});
+    b.push('replaceDevice', {interface: 'BidCos-RF', addresses: ['JEQ0000005', 'JEQ0000006']});
+    await until(() => calls.length === 4);
+    assert.deepEqual(calls, [
+        ['x', 'JEQ0000001', 1],
+        ['x', 'JEQ0000002', 'JEQ0000003'],
+        ['x', 'JEQ0000004', 0],
+        ['x', 'JEQ0000005', 'JEQ0000006'],
+    ]);
+    const live = events.filter((e) => e.kind !== 'new');
+    assert.deepEqual(live.map((e) => [e.kind, e.hint, e.old, e.new]), [
+        ['updated', 1, undefined, undefined],
+        ['replaced', undefined, 'JEQ0000002', 'JEQ0000003'],
+        ['updated', 0, undefined, undefined],
+        ['replaced', undefined, 'JEQ0000005', 'JEQ0000006'],
+    ]);
+    srv.close();
 });
 
 test('every request says Accept: application/json, the streams text/event-stream', async (t) => {

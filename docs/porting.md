@@ -146,8 +146,8 @@ homematic-xmlrpc's or binrpc's `createServer` feeds from the stream unchanged:
 | `system.multicall` | `[[{methodName: 'event', params: [initId, address, key, value]}, …]]` | one call per stream batch (`batches: false` gives single `event`s) |
 | `newDevices` | `[initId, descriptions]` | the descriptions, as `listDevices` gives them |
 | `deleteDevices` | `[initId, addresses]` | |
-| `updateDevice` | `[initId, address, hint]` | `hint` is `0`: the stream carries none |
-| `replaceDevice` | `[initId, oldAddress, newAddress]` | |
+| `updateDevice` | `[initId, address, hint]` | `hint` as the interface sent it (0 unspecified, 1 the links changed, 2 the description changed); `0` from a system whose stream carries none |
+| `replaceDevice` | `[initId, oldAddress, newAddress]` | the stream's `old`/`new` |
 | `readdedDevice` | `[initId, addresses]` | |
 | `interface` | `[initId, interface, state]` | synthetic, only with `interfaceEvents: true`: `up`, `down`, `restarted`, `added`, `removed` - for a program that drove its per-interface status from `init`'s success |
 

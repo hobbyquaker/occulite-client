@@ -250,6 +250,17 @@ export class FakeBox {
         return this.metaStreams.size;
     }
 
+    /** An interface's `updateDevice(address, hint)`, as the stream carries it: `hint` 0 unspecified, 1 the links
+     *  changed, 2 the description changed. */
+    updateDevice(iface: string, address: string, hint = 0): void {
+        this.push('updateDevice', {interface: iface, addresses: [address], hint});
+    }
+
+    /** An interface's `replaceDevice(old, new)`: `addresses` is `[old, new]`, and `old`/`new` name them. */
+    replaceDevice(iface: string, oldAddress: string, newAddress: string): void {
+        this.push('replaceDevice', {interface: iface, addresses: [oldAddress, newAddress], old: oldAddress, new: newAddress});
+    }
+
     /** The code of a pairing request, as the Status page shows it (plain HTTP: no fingerprint). */
     pairingCode(id: string): string {
         const p = this.pairings.get(id)!;
