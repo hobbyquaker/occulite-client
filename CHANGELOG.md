@@ -112,7 +112,7 @@ complete, the system API's slice, typed descriptions and certificates, and the p
   error for a non-running interface.
 
 - Fixed: `MetaCopy` read an enum's nodes from `nodes`/`children`, but the format's key is `tree` - `rooms()`,
-  `functions()` and `membership()` were empty against a real system (B-1).
+  `functions()` and `membership()` were empty against a real system.
 
 - Credentials: `auth` takes an `AuthProvider` beside `{token}`/`{session}`; `occulite-client/node` has
   `nodeAuth('auto' | {token} | {session} | {addon} | {local: true})` - `'auto'` is `OCCULITE_TOKEN`, the addon's
