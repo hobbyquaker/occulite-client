@@ -169,3 +169,93 @@ test('dropMetaStreams ends the metadata change stream, and the client reopens it
     await until(() => box.metaStreamsOpened === 2, 5000);
     await until(() => box.metaStreamsOpen === 1);
 });
+
+test('metaSettled: right after a change applied in place, and once the snapshot read again for one that cannot be is in', async (t) => {
+    const box = new FakeBox({meta: {revision: 1, objects: {'X.a:1': {name: 'Lampe', enums: ['room/eg']}}, enums: {room: {tree: [{id: 'eg', name: 'EG'}]}}}});
+    await box.start();
+    t.after(() => box.stop());
+    const c = new OccuLite({url: box.url, values: false, devices: false});
+    t.after(() => c.close());
+    await c.ready();
+    await until(() => box.metaStreamsOpened === 1);
+    const seen: string[] = [];
+    c.on('meta', (ev: {revision: number}) => seen.push(`meta ${ev.revision} ${c.meta.revision}`));
+    c.on('metaSettled', (ev: {revision: number; reread: boolean}) => seen.push(`settled ${ev.revision} ${ev.reread} ${c.meta.membershipNames('X.a:1').rooms.join()}`));
+    // in place: settled at once, after meta
+    box.opts.meta = {revision: 2, objects: {'X.a:1': {name: 'Deckenlampe', enums: ['room/eg']}}, enums: {room: {tree: [{id: 'eg', name: 'EG'}]}}};
+    box.metaEvent({revision: 2, kind: 'object.updated', ref: 'X.a:1', value: {name: 'Deckenlampe', enums: ['room/eg']}});
+    await until(() => seen.length === 2);
+    assert.deepEqual(seen, ['meta 2 2', 'settled 2 false EG']);
+    // a created node and the assignment: the copy cannot follow; meta comes with the old state, settled with the new
+    box.opts.meta = {revision: 4, objects: {'X.a:1': {name: 'Deckenlampe', enums: ['room/og']}}, enums: {room: {tree: [{id: 'eg', name: 'EG'}, {id: 'og', name: 'OG'}]}}};
+    box.metaEvent({revision: 3, kind: 'node.created', enum: 'room', path: 'room/og', value: {id: 'og', name: 'OG'}});
+    box.metaEvent({revision: 4, kind: 'object.updated', ref: 'X.a:1', value: {name: 'Deckenlampe', enums: ['room/og']}});
+    await until(() => seen.length === 5);
+    assert.deepEqual(seen.slice(2), ['meta 3 2', 'meta 4 2', 'settled 4 true OG'], 'no settled while the re-read is due');
+    assert.equal(c.meta.revision, 4);
+});
+
+test('metaSettled: a failed re-read is tried again; changes during the read wait for the newer one; close() ends it', async (t) => {
+    const box = new FakeBox({meta: {revision: 1, objects: {}, enums: {}}});
+    await box.start();
+    t.after(() => box.stop());
+    const c = new OccuLite({url: box.url, values: false, devices: false, reconnect: {min: 50, max: 100}});
+    t.after(() => c.close());
+    await c.ready();
+    await until(() => box.metaStreamsOpened === 1);
+    const settled: {revision: number; reread: boolean}[] = [];
+    c.on('metaSettled', (ev: {revision: number; reread: boolean}) => settled.push(ev));
+    // the snapshot is not available: no settled until a later read gets it
+    box.opts.metaRoute = false;
+    box.metaEvent({revision: 2, kind: 'import', objects: 1, enums: 0});
+    await new Promise((r) => setTimeout(r, 400));
+    assert.deepEqual(settled, []);
+    box.opts.metaRoute = true;
+    box.opts.meta = {revision: 2, objects: {'X.a:1': {name: 'Neu'}}, enums: {}};
+    await until(() => settled.length === 1);
+    assert.deepEqual(settled, [{revision: 2, reread: true}]);
+    assert.equal(c.meta.name('X.a:1'), 'Neu');
+    // a change that arrives while the re-read is on its way: that read's answer is not taken for settled
+    box.opts.hang = true;
+    box.metaEvent({revision: 3, kind: 'import', objects: 1, enums: 0});
+    await new Promise((r) => setTimeout(r, 300)); // the read is out and held
+    box.opts.meta = {revision: 4, objects: {'X.a:1': {name: 'Neuer'}}, enums: {}};
+    let metaSeen = 0;
+    c.on('meta', (ev: {revision: number}) => (metaSeen = ev.revision));
+    box.metaEvent({revision: 4, kind: 'import', objects: 1, enums: 0});
+    await until(() => metaSeen === 4); // the next re-read is due before the held one is answered
+    box.resume();
+    await until(() => settled.length === 2);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.deepEqual(settled.slice(1), [{revision: 4, reread: true}], 'one settled, from the newer read');
+    const count = settled.length;
+    // close() while a re-read is held: nothing more is emitted
+    box.opts.hang = true;
+    box.metaEvent({revision: 5, kind: 'import', objects: 1, enums: 0});
+    await new Promise((r) => setTimeout(r, 300));
+    c.close();
+    box.resume();
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(settled.length, count);
+});
+
+test('metaSettled: without a reconnect option a failed re-read is tried again after a second', async (t) => {
+    const box = new FakeBox({meta: {revision: 1, objects: {}, enums: {}}});
+    await box.start();
+    t.after(() => box.stop());
+    const c = new OccuLite({url: box.url, values: false, devices: false});
+    t.after(() => c.close());
+    await c.ready();
+    await until(() => box.metaStreamsOpened === 1);
+    const settled: number[] = [];
+    c.on('metaSettled', (ev: {revision: number}) => settled.push(ev.revision));
+    box.opts.metaRoute = false;
+    box.metaEvent({revision: 2, kind: 'import', objects: 1, enums: 0});
+    await new Promise((r) => setTimeout(r, 400)); // the first read failed
+    box.opts.metaRoute = true;
+    box.opts.meta = {revision: 2, objects: {}, enums: {}};
+    const t0 = Date.now();
+    await until(() => settled.length === 1);
+    assert.ok(Date.now() - t0 > 500, 'the retry waits the default delay');
+    assert.deepEqual(settled, [2]);
+});

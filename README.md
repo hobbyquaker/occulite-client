@@ -102,6 +102,8 @@ await box.call('BidCos-RF', 'getLinks', ['JEQ0230153:1', 0])
 box.meta.name('HmIP-RF.000A1B2C3D4E5F:4')
 box.meta.rooms({inherit: true})
 box.meta.membership(ref)                            // {rooms: [{path, id, name, depth}], functions} - most specific first
+box.on('meta', ev => {})                            // a change event of the metadata, as the stream sent it
+box.on('metaSettled', ({revision, reread}) => {})   // box.meta is in step again: derive your names here
 await box.history('HmIP-RF.000A1B2C3D4E5F:1.ACTUAL_TEMPERATURE', {maxPoints: 288})
 ```
 

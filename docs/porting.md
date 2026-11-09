@@ -171,7 +171,10 @@ are); `initIds: {iface: id}` pins single ones.
 
 The metadata is a **live copy**: the snapshot at connect (or the last one from the cache before the system answers),
 then the change stream applied in place - `box.meta.name(ref)` is a Map lookup, never a request; `box.on('meta', ev)`
-tells you what changed. The writes mirror the API (`objects.patch/put/delete/bulk`, `enums.*`, `tree.*`,
+tells you what changed, and `box.on('metaSettled', ({revision, reread}) => …)` that the copy is in step again: right
+after a change applied in place, or once the snapshot is read again for one the copy cannot apply (a created or
+deleted node, an import, a gap) - **derive your names on `metaSettled`, not on `meta`**, whose copy still holds the
+old state in the second case. The writes mirror the API (`objects.patch/put/delete/bulk`, `enums.*`, `tree.*`,
 `import`, `export`) and need `meta:write`.
 
 ## 6. Common HM-Scripts and their replacements

@@ -128,6 +128,16 @@ export interface DevicesEvent {
     new?: string;
 }
 
+/** A `metaSettled` event: `box.meta` is in step with the system at `revision` - after a change applied in
+ *  place (right after its `meta` event, `reread: false`), or once the snapshot read again for a change the
+ *  copy could not apply in place (a created or deleted node, an import, a gap) is in (`reread: true`).
+ *  Derive names from `box.meta` here, not on `meta`: after a `meta` event that forces a re-read the copy
+ *  still holds the old state. */
+export interface MetaSettledEvent {
+    revision: number;
+    reread: boolean;
+}
+
 /** One interface the system runs, as GET /api/rpc/v1/interfaces answers it (the names are the
  *  InterfacesList.xml names lite-rpc's paths take). */
 export interface InterfaceInfo {
@@ -219,6 +229,8 @@ export class OccuLite {
     private devicesSeen = new Set<string>();
     private devicesWaiter: (() => void) | undefined;
     private metaRefresh: ReturnType<typeof setTimeout> | undefined;
+    /** a change event the copy could not apply: a snapshot re-read is due */
+    private metaStale = false;
     /** the auth state named the scopes (a system without it is taken for full access) */
     private scopesKnown = false;
     private resyncing = false;
@@ -322,7 +334,7 @@ export class OccuLite {
     // ---- events ------------------------------------------------------------------------------
 
     /** Subscribes; the answer unsubscribes. Events: status, value, batch, devices, interface, meta,
-     *  sweep, resync, error - and serviceMessages, whose stream (GET /api/system/v1/service-messages/stream,
+     *  metaSettled, sweep, resync, error - and serviceMessages, whose stream (GET /api/system/v1/service-messages/stream,
      *  one more of the token's streams) is opened with the first handler and closed with the last. */
     on(event: string, fn: Handler): () => void {
         let s = this.handlers.get(event);
@@ -571,12 +583,12 @@ export class OccuLite {
         if (eventId && !this.lastEventId) this.lastEventId = eventId;
     }
 
-    private async loadMeta(signal?: AbortSignal): Promise<void> {
+    private async loadMeta(signal?: AbortSignal): Promise<boolean> {
         const doc = await this.request<MetaDocument>('GET', '/api/meta/v1/snapshot', undefined, {signal}).catch(() => undefined);
-        if (doc) {
-            this.meta.load(doc);
-            await Promise.resolve(this.cache.set(META_SNAPSHOT_KEY, doc)).catch((e) => this.opts.log?.warn?.(`occulite-client: the cache did not take the snapshot: ${(e as Error).message}`));
-        }
+        if (!doc) return false;
+        this.meta.load(doc);
+        await Promise.resolve(this.cache.set(META_SNAPSHOT_KEY, doc)).catch((e) => this.opts.log?.warn?.(`occulite-client: the cache did not take the snapshot: ${(e as Error).message}`));
+        return true;
     }
 
     /** Opens a stream with a silence watchdog: no message or ping for streamTimeout ends it, and
@@ -874,8 +886,13 @@ export class OccuLite {
                         } catch {
                             continue;
                         }
-                        if (!this.meta.apply(ev)) this.refreshMetaSoon();
+                        const inPlace = this.meta.apply(ev);
+                        if (!inPlace) {
+                            this.metaStale = true;
+                            this.refreshMetaSoon();
+                        }
                         this.emit('meta', ev);
+                        if (!this.metaStale) this.emit('metaSettled', {revision: this.meta.revision, reread: false});
                     }
                 }
             } catch (e) {
@@ -950,9 +967,18 @@ export class OccuLite {
         }
     }
 
-    private refreshMetaSoon(): void {
+    /** A change the copy cannot apply in place: a fresh snapshot shortly (the events of one write come
+     *  together), `metaSettled` once it is in; a failed read is tried again after a while. */
+    private refreshMetaSoon(delay = 200): void {
         clearTimeout(this.metaRefresh);
-        this.metaRefresh = setTimeout(() => void this.loadMeta(), 200);
+        this.metaRefresh = setTimeout(async () => {
+            this.metaRefresh = undefined;
+            const ok = await this.loadMeta();
+            if (this.abort.signal.aborted || this.metaRefresh) return; // closed, or another change came in meanwhile
+            if (!ok) return this.refreshMetaSoon(this.opts.reconnect?.min ?? 1000);
+            this.metaStale = false;
+            this.emit('metaSettled', {revision: this.meta.revision, reread: true});
+        }, delay);
     }
 
     // ---- requests over lite-rpc's JSON-RPC path --------------------------------------------------

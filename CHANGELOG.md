@@ -9,6 +9,11 @@
   The client now knows the system's rule (each rpc tier includes the ones before it, a write its read, `*`
   everything) in one place: `covers(scopes, scope)` and `normalizeScopes(scopes)` from the package root (with
   `SCOPE_INCLUDES`), and `box.hasScope(scope)` on the client.
+- **`metaSettled` event:** `box.meta` is in step with the system again - right after a change applied in place (after
+  its `meta` event, `reread: false`), or once the snapshot read again for a change the copy cannot apply in place (a
+  created or deleted node, an import, a gap) is in (`reread: true`; `MetaSettledEvent`, exported). Until now nothing
+  said when the re-read had landed, and names derived on `meta` showed the old state. A failed re-read is tried again
+  with the reconnect delay.
 - **`FakeBox` answers scopes as the system does:** a route's scope is checked with the tiers (`scopes: ['rpc:admin']`
   reads lite-rpc, `meta:write` includes `meta:read`), `GET /api/auth/v1/state` lists the highest tier only
   (`['rpc:read', 'rpc:operate']` reads back as `['rpc:operate']`), and a pairing request is approved with the scopes
@@ -20,7 +25,8 @@
 
 - A consumer that worked around the literal scope check drops the workaround with this release: a transport wrapper
   that adds the implied tiers to the auth state's scopes (a scope- or tier-aware transport), its own `rpc:read` test
-  beside it. Known ones: hm2mqtt.js 3.10.0 (`scopeTransport`), node-red-contrib-ccu
+  beside it, and a timed re-derive of the names after a `meta` event (derive them on `metaSettled`). Known ones:
+  hm2mqtt.js 3.10.0 (`scopeTransport`, and the names derived again after `meta`), node-red-contrib-ccu
   (`tierAwareTransport`), ioBroker.hm-rpc's openccu-lite port (its `tierAwareTransport` shim).
 - A test against `FakeBox` that compared the auth state's scopes, or `box.scopes`, with a list holding a lower tier
   beside a higher one (`['rpc:read', 'rpc:operate']`) now gets the highest only; one that paired and expected
