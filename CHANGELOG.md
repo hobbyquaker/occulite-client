@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 / 2026-11-09
 
 - **A token with a higher rpc tier runs full, not names-only.** openccu-lite lists only the highest scope a token
   holds - a token paired for devices at *operate* reads `["meta:read", "rpc:operate"]`, at *administer*
