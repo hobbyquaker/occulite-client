@@ -444,6 +444,7 @@ export interface PairOptions {
 export interface Paired {
     token: string;
     name: string;
+    /** as the system lists them: the highest tier only (`devices: 'operate'` → `rpc:operate`); test them with `covers()` */
     scopes: string[];
     access: Record<string, string>;
     /** the certificate the code was bound to ('' over plain HTTP): pin it */

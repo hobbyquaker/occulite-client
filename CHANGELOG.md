@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- **A token with a higher rpc tier runs full, not names-only.** openccu-lite lists only the highest scope a token
+  holds - a token paired for devices at *operate* reads `["meta:read", "rpc:operate"]`, at *administer*
+  `rpc:admin`, with no `rpc:read` beside it - and the client looked for a literal `rpc:read`, so every program paired
+  at operate, configure or administer (or an addon declaring `rpc:operate`) got no devices, no values and no stream.
+  The client now knows the system's rule (each rpc tier includes the ones before it, a write its read, `*`
+  everything) in one place: `covers(scopes, scope)` and `normalizeScopes(scopes)` from the package root (with
+  `SCOPE_INCLUDES`), and `box.hasScope(scope)` on the client.
+- **`FakeBox` answers scopes as the system does:** a route's scope is checked with the tiers (`scopes: ['rpc:admin']`
+  reads lite-rpc, `meta:write` includes `meta:read`), `GET /api/auth/v1/state` lists the highest tier only
+  (`['rpc:read', 'rpc:operate']` reads back as `['rpc:operate']`), and a pairing request is approved with the scopes
+  of its `access` and `addons` (`devices: 'administer'` → `rpc:admin`, where it answered `['rpc:read']` for any
+  request); the issued tokens are credentials beside `token` (`box.tokens`), and an unknown area or level is a `422`
+  as on the system. `PAIRING_LEVELS` and `pairingScopes()` are exported from `occulite-client/testing`.
+
+### Upgrading
+
+- A consumer that worked around the literal scope check drops the workaround with this release: a transport wrapper
+  that adds the implied tiers to the auth state's scopes (a scope- or tier-aware transport), its own `rpc:read` test
+  beside it. Known ones: hm2mqtt.js 3.10.0 (`scopeTransport`), node-red-contrib-ccu
+  (`tierAwareTransport`), ioBroker.hm-rpc's openccu-lite port (its `tierAwareTransport` shim).
+- A test against `FakeBox` that compared the auth state's scopes, or `box.scopes`, with a list holding a lower tier
+  beside a higher one (`['rpc:read', 'rpc:operate']`) now gets the highest only; one that paired and expected
+  `scopes: ['rpc:read']` gets the scopes of its `access`.
+
 ## 0.3.0 / 2026-10-02
 
 - `httpError(status, body)` and `abortError(signal, what)` are exported from the package root: an adapter maps and

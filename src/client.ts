@@ -8,6 +8,7 @@
 import {META_SNAPSHOT_KEY, descriptionKey, memoryCache, type DescriptionCache} from './cache.ts';
 import {OccuLiteError, abortError, httpError, timeoutSignal} from './errors.ts';
 import {MetaCopy, type MetaDocument, type MetaEvent, type WriteOptions, type WriteResult} from './meta.ts';
+import {covers} from './scopes.ts';
 import {datapointRef, deviceOf, parseDatapointRef, parseRef, ref as mkRef} from './refs.ts';
 import {parseSSE} from './sse.ts';
 import {SystemAPI} from './system.ts';
@@ -187,7 +188,7 @@ export class OccuLite {
     scopes: string[] = [];
     /** which credential is in use */
     credential: Credential = 'none';
-    /** full, or names-only for a credential without rpc:read */
+    /** full, or names-only for a credential without rpc:read (a higher rpc tier or `*` includes it) */
     mode: Mode = 'full';
     /** the interfaces followed, with their state: from GET /api/rpc/v1/interfaces (rpc:read), else
      *  learned from the stream's hello; kept live from the interface events */
@@ -218,6 +219,8 @@ export class OccuLite {
     private devicesSeen = new Set<string>();
     private devicesWaiter: (() => void) | undefined;
     private metaRefresh: ReturnType<typeof setTimeout> | undefined;
+    /** the auth state named the scopes (a system without it is taken for full access) */
+    private scopesKnown = false;
     private resyncing = false;
     /** the keys the state store keeps (its first page's `datapoints`); the sweep asks for the rest */
     private storeKeys: Set<string> | undefined;
@@ -307,6 +310,13 @@ export class OccuLite {
             this.reauthAt = Date.now();
         }
         return this.takeAuth(await a.resolve(reason));
+    }
+
+    /** Whether the credential may do what needs `scope`, as the system decides it: the scope itself,
+     *  Full access, or one that includes it (`rpc:operate` covers `rpc:read`; the auth state lists only
+     *  the highest tier). True before connect and on a system without an auth state (taken for full access). */
+    hasScope(scope: string): boolean {
+        return !this.scopesKnown || covers(this.scopes, scope);
     }
 
     // ---- events ------------------------------------------------------------------------------
@@ -431,7 +441,9 @@ export class OccuLite {
         });
         if (st.authenticated === false) throw unauth();
         this.scopes = st.scopes ?? [];
-        const rpc = st.scopes === undefined || this.scopes.includes('*') || this.scopes.includes('rpc:read');
+        this.scopesKnown = st.scopes !== undefined;
+        // the system lists only the highest tier a token holds (rpc:operate, not rpc:read beside it)
+        const rpc = this.hasScope('rpc:read');
         this.mode = rpc ? 'full' : 'names-only';
         if (rpc) await this.loadInterfaces(signal);
         await Promise.all([this.opts.values === false || !rpc ? undefined : this.loadValues(signal), this.opts.meta === false ? undefined : this.loadMeta(signal)]);

@@ -242,7 +242,9 @@ Status page with one click; it answers the token, the scopes and the certificate
 
 The last line of the first row surprises a program that forwards arbitrary methods (an `rpc/#` topic, a `ccu-rpc`
 node): on openccu-lite the token's tier limits what its users can call - a documented behaviour change (§12), not a
-bug. A `403` names the scope the token lacks (`OccuLiteError.scope`): tell the operator to pair again with more
+bug. **The auth state and the pairing answer list only the highest tier**: `devices: 'administer'` reads back as
+`rpc:admin`, with no `rpc:read`, `rpc:operate` or `rpc:configure` beside it; `box.hasScope('rpc:operate')` (or
+`covers(scopes, …)`) knows the tiers - never compare scope names yourself. A `403` names the scope the token lacks (`OccuLiteError.scope`): tell the operator to pair again with more
 access, or to grant it in the API tokens panel; the scopes can only be narrowed on an existing token.
 
 **Streams per token: two.** One connection uses one for the events and one for the metadata (a third for the service

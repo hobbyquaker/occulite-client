@@ -6,6 +6,7 @@ export {OccuLiteError, abortError, httpError, type CertificateInfo} from './erro
 export {GROUPS_TIMEOUT, SystemAPI, type CallOptions, type GroupMember, type HeatingGroup, type HeatingGroupDetail, type HeatingGroupList, type HeatingGroupType, type HistoryList, type RadioHealth, type RadioInterfaceHealth, type RadioSample, type RpcFeed, type StatusInfo, type SystemHost} from './system.ts';
 export type {DeviceDescription, ParamDescription, ParamValue, ParamsetDescription, ServiceMessage, ServiceMessageView, SpecialValue} from './types.ts';
 export {MetaCopy, type MetaDocument, type MetaEnum, type MetaErrorCode, type MetaEvent, type MetaNode, type MetaObject, type MetaWriter, type NodeInfo, type NodeRef, type WriteOptions, type WriteResult} from './meta.ts';
+export {SCOPE_INCLUDES, covers, normalizeScopes} from './scopes.ts';
 export {datapointRef, deviceOf, parseDatapointRef, parseRef, ref} from './refs.ts';
 export {parseSSE, type SSEMessage} from './sse.ts';
 export {fetchTransport, type Transport, type TransportResponse} from './transport.ts';

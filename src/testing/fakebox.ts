@@ -8,6 +8,7 @@
 import {createHash, randomBytes} from 'node:crypto';
 import http from 'node:http';
 import type {AddressInfo} from 'node:net';
+import {covers, normalizeScopes} from '../scopes.ts';
 
 export interface FakeValue {
     value: unknown;
@@ -22,6 +23,9 @@ export interface FakeBoxOptions {
     /** a browser session id: accepted as the cookie `occulite_session=<id>` or as a Bearer; a
      *  state-changing call on the cookie alone must carry X-Occulite-Request (403 request-header) */
     session?: string;
+    /** what the token (and the session) may do, default `['*']`; checked as the system does - a write
+     *  includes its read, each rpc tier the ones before it - and answered by the auth state as the system
+     *  lists it (the highest tier only: `['rpc:read', 'rpc:operate']` reads back as `['rpc:operate']`) */
     scopes?: string[];
     /** the interfaces the system runs, a name or {name, running} (default HmIP-RF, running) */
     interfaces?: (string | {name: string; running?: boolean})[];
@@ -67,6 +71,29 @@ export interface FakeBoxOptions {
     historyRemove?: string[];
 }
 
+/** Pairing's levels per area and the scopes each carries (occulited's table): a token paired for devices
+ *  at operate holds rpc:read and rpc:operate, and the auth state lists it as rpc:operate. */
+export const PAIRING_LEVELS: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
+    devices: {read: ['rpc:read'], operate: ['rpc:read', 'rpc:operate'], configure: ['rpc:read', 'rpc:operate', 'rpc:configure'], administer: ['rpc:read', 'rpc:operate', 'rpc:configure', 'rpc:admin']},
+    names: {read: ['meta:read'], configure: ['meta:read', 'meta:write']},
+    system: {read: ['system:read', 'logs:read'], configure: ['system:read', 'logs:read', 'system:write']},
+    backup: {download: ['backup']},
+};
+
+/** The scopes a pairing request's access and addons are approved with, as the system answers them; a
+ *  string for an unknown area or level, or a request that asks for nothing (the system's 422). */
+export function pairingScopes(access: Record<string, string> | undefined, addons: string[] = []): string[] | string {
+    const out: string[] = addons.map((a) => `addon:${a}`);
+    for (const [area, level] of Object.entries(access ?? {})) {
+        if (!level || level === 'none') continue;
+        const lv = PAIRING_LEVELS[area];
+        if (!lv) return `unknown area "${area}" (devices, names, system, backup)`;
+        if (!Object.hasOwn(lv, level)) return `${area} has no level "${level}" (${Object.keys(lv).sort().join(', ')})`;
+        out.push(...lv[level]);
+    }
+    return out.length ? normalizeScopes(out) : 'ask for access to at least one area';
+}
+
 interface Stream {
     res: http.ServerResponse;
     interfaces: string[];
@@ -94,7 +121,9 @@ export class FakeBox {
     readonly systemRequests: string[] = [];
     private serviceStreams = new Set<http.ServerResponse>();
     private held = new Set<{req: http.IncomingMessage; res: http.ServerResponse}>();
-    readonly pairings = new Map<string, {poll: string; nonce: Buffer; commit: string; clientNonce?: Buffer; state: string; token?: string; access: unknown; app: string}>();
+    readonly pairings = new Map<string, {poll: string; nonce: Buffer; commit: string; clientNonce?: Buffer; state: string; token?: string; access: Record<string, string> | undefined; addons?: string[]; app: string; scopes: string[]}>();
+    /** the tokens pairing issued, with their scopes as the system lists them; each is a credential beside `token` */
+    readonly tokens = new Map<string, string[]>();
 
     readonly opts: FakeBoxOptions;
 
@@ -142,10 +171,16 @@ export class FakeBox {
         return (this.opts.interfaces ?? ['HmIP-RF']).map((i) => (typeof i === 'string' ? {name: i, running: true} : {name: i.name, running: i.running !== false})).sort((a, b) => (a.name < b.name ? -1 : 1));
     }
 
-    /** The scopes the credential has; every lite-rpc route needs rpc:read (as on the system). */
-    private lacks(scope: string): boolean {
-        const have = this.opts.scopes ?? ['*'];
-        return !have.includes('*') && !have.includes(scope);
+    /** The scopes of the request's credential: a paired token's own, else `scopes` (default Full access). */
+    private scopesOf(req: http.IncomingMessage): string[] {
+        const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1];
+        return (bearer && this.tokens.get(bearer)) || this.opts.scopes || ['*'];
+    }
+
+    /** Whether the credential lacks `scope`, as the system decides it (every lite-rpc route needs rpc:read,
+     *  which each higher tier includes). */
+    private lacks(req: http.IncomingMessage, scope: string): boolean {
+        return !covers(this.scopesOf(req), scope);
     }
 
     private json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -158,6 +193,7 @@ export class FakeBox {
     private authorized(req: http.IncomingMessage): 0 | 401 | 403 {
         if (!this.opts.token && !this.opts.session) return 0;
         const bearer = req.headers.authorization;
+        if (bearer?.startsWith('Bearer ') && this.tokens.has(bearer.slice(7))) return 0;
         if (this.opts.token && bearer === `Bearer ${this.opts.token}`) return 0;
         if (this.opts.session && bearer === `Bearer ${this.opts.session}`) return 0;
         const cookie = /(?:^|;\s*)(?:__Secure-)?occulite_session=([^;]+)/.exec(req.headers.cookie ?? '')?.[1];
@@ -268,11 +304,14 @@ export class FakeBox {
         return String(d.readUInt32BE(0) % 1_000_000).padStart(6, '0');
     }
 
+    /** Approves a pairing request as the administrator does: the token carries the scopes of the
+     *  request's access and addons and is accepted from now on. */
     approve(id: string): void {
         const p = this.pairings.get(id);
         if (p) {
             p.state = 'approved';
             p.token = `olt_${randomBytes(16).toString('hex')}`;
+            this.tokens.set(p.token, p.scopes);
         }
     }
 
@@ -293,10 +332,12 @@ export class FakeBox {
         // pairing: open, the poll secret is the credential
         if (key === 'POST /api/auth/v1/pairing/request') {
             const b = await this.body(req);
+            const scopes = pairingScopes(b.access, b.addons);
+            if (typeof scopes === 'string') return this.json(res, 422, {error: 'invalid', message: scopes});
             const id = randomBytes(4).toString('hex');
             const poll = randomBytes(12).toString('hex');
             const nonce = randomBytes(16);
-            this.pairings.set(id, {poll, nonce, commit: b.commit, state: 'pending', access: b.access, app: b.app});
+            this.pairings.set(id, {poll, nonce, commit: b.commit, state: 'pending', access: b.access, addons: b.addons, app: b.app, scopes});
             return this.json(res, 202, {id, poll, nonce: nonce.toString('hex'), expires_in: 300, interval: 2, fingerprint: ''});
         }
         const pm = /^\/api\/auth\/v1\/pairing\/request\/([^/]+)$/.exec(path);
@@ -323,7 +364,7 @@ export class FakeBox {
             if (res.closed) return;
             if (p.state === 'approved') {
                 this.pairings.delete(pm[1]);
-                return this.json(res, 200, {state: 'approved', token: p.token, name: `${p.app}-fake`, scopes: ['rpc:read'], access: p.access});
+                return this.json(res, 200, {state: 'approved', token: p.token, name: `${p.app}-fake`, scopes: p.scopes, access: p.access, ...(p.addons?.length ? {addons: p.addons} : {})});
             }
             return this.json(res, 200, {state: p.state});
         }
@@ -332,12 +373,12 @@ export class FakeBox {
         if (key === 'GET /api/auth/v1/state' && verdict === 401 && !req.headers.authorization && !req.headers.cookie) return this.json(res, 200, {authenticated: false, setup_required: false});
         if (verdict === 401) return this.json(res, 401, {error: 'unauthenticated', message: 'login required'});
         if (verdict === 403) return this.json(res, 403, {error: 'request-header', message: 'a state-changing call with the session cookie alone must carry the header X-Occulite-Request'});
-        if (key === 'GET /api/auth/v1/state') return this.json(res, 200, {authenticated: true, scopes: this.opts.scopes ?? ['*']});
+        if (key === 'GET /api/auth/v1/state') return this.json(res, 200, {authenticated: true, scopes: normalizeScopes(this.scopesOf(req))});
         if (key === 'POST /api/auth/v1/tokens/self/rotate') {
             this.opts.token = `olt_${randomBytes(16).toString('hex')}`;
             return this.json(res, 200, {token: this.opts.token, name: 'fake', previous_valid_s: 60});
         }
-        if (path.startsWith('/api/rpc/v1/') && this.lacks('rpc:read')) return this.json(res, 403, {error: 'forbidden', scope: 'rpc:read', message: 'the credential lacks rpc:read'});
+        if (path.startsWith('/api/rpc/v1/') && this.lacks(req, 'rpc:read')) return this.json(res, 403, {error: 'forbidden', scope: 'rpc:read', message: 'the credential lacks rpc:read'});
         if (key === 'GET /api/rpc/v1/interfaces') {
             if (this.opts.interfacesRoute === false) return this.json(res, 404, {error: 'not_found', message: 'no route'});
             return this.json(res, 200, this.ifaceList().map((i) => ({name: i.name, protocol: 'xmlrpc', url_path: `/api/rpc/v1/xmlrpc/${i.name}`, running: i.running})));
@@ -441,7 +482,7 @@ export class FakeBox {
         // the metadata writes: recorded, one revision each, If-Match checked, a {} PATCH is a 304 - the shapes of
         // docs/meta-api.md without the store's semantics (the copy follows the change stream, which a test drives)
         if (path.startsWith('/api/meta/v1/') && (req.method === 'PUT' || req.method === 'PATCH' || req.method === 'POST' || req.method === 'DELETE')) {
-            if (this.lacks('meta:write')) return this.json(res, 403, {error: 'forbidden', scope: 'meta:write', message: 'the credential lacks meta:write'});
+            if (this.lacks(req, 'meta:write')) return this.json(res, 403, {error: 'forbidden', scope: 'meta:write', message: 'the credential lacks meta:write'});
             const meta = (this.opts.meta ??= {revision: 0, objects: {}, enums: {}});
             const ct = String(req.headers['content-type'] ?? '');
             let raw = '';
@@ -476,7 +517,7 @@ export class FakeBox {
         this.systemRequests.push(key);
         if (this.opts.systemApi === false) return this.json(res, 404, {error: 'not_found', message: `no route ${key}`});
         const safe = req.method === 'GET' || req.method === 'HEAD';
-        if (this.lacks(safe ? 'system:read' : 'system:write')) return this.json(res, 403, {error: 'forbidden', scope: safe ? 'system:read' : 'system:write', message: `the credential lacks ${safe ? 'system:read' : 'system:write'}`});
+        if (this.lacks(req, safe ? 'system:read' : 'system:write')) return this.json(res, 403, {error: 'forbidden', scope: safe ? 'system:read' : 'system:write', message: `the credential lacks ${safe ? 'system:read' : 'system:write'}`});
         if (key === 'GET /status') return this.json(res, 200, this.opts.status ?? {hostname: 'fakebox', version: {version: '3.89.11.20260919', product: 'fake', platform: 'fake', lite: '1.0.0-dev.0'}, occulited_version: 'fakebox', uptime_s: 42, load: [0.1, 0.2, 0.3], mem_total_kb: 1024, mem_available_kb: 512, disks: [{mount: '/', total_kb: 1000, used_kb: 500}], time: new Date().toISOString(), timezone: 'Europe/Berlin', hm_mode: 'HMIP'});
         if (key === 'GET /radio/health') return this.json(res, 200, this.opts.radioHealth ?? {polled: new Date().toISOString(), interfaces: [{interface: 'HmIP-RF', address: '3014F711A0000000000000FA', type: 'RPI-RF-MOD', connected: true, default: true, firmware: '4.4.22', duty_cycle: 3, carrier_sense: 12, carrier_sense_source: 'event'}], answering: [], errors: {}, history: {'HmIP-RF/3014F711A0000000000000FA': [{t: '2026-09-25T00:00:00Z', dc: 2, cs: 10, up: true}, {t: '2026-09-25T00:01:00Z', dc: 3, cs: 12, up: true}]}, busy: false, busy_interface: ''});
         if (key === 'GET /service-messages') return this.json(res, 200, this.serviceView());

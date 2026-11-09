@@ -243,6 +243,8 @@ const box = createClient({url: 'http://127.0.0.1', auth: 'auto', addon: 'hm2mqtt
 await box.ready()
 box.credential   // 'token' | 'addon' | 'local' | 'session' | 'none' - for your status line
 box.mode         // 'full' | 'names-only'
+box.scopes       // the auth state's list: the highest tier only, e.g. ['meta:read', 'rpc:operate']
+box.hasScope('rpc:read')   // true: each rpc tier includes the ones before it, a write its read, '*' everything
 ```
 
 `auth` also takes `{token}`, `{session}`, `{addon: '<id>'}`, `{local: true}` or your own `AuthProvider`
@@ -250,8 +252,15 @@ box.mode         // 'full' | 'names-only'
 after a `401`, so a token created or minted later is picked up without a restart. Without any credential `ready()`
 rejects `unauthenticated` with the hint to pair or pass a token.
 
+**Scopes.** openccu-lite lists only the highest scope a token holds: a token paired for devices at *operate* reads
+`['meta:read', 'rpc:operate']`, with no `rpc:read` beside it, because each rpc tier includes the ones before it
+(`rpc:operate` → `rpc:read`, `rpc:configure` → both, `rpc:admin` → all three), a write its read (`meta:write` →
+`meta:read`, `system:write` → `system:read`) and `*` everything. Never look for a scope in `box.scopes` literally:
+`box.hasScope(scope)`, or `covers(scopes, scope)` from the package root for a list of your own, answers as the system
+decides.
+
 **Names only.** The local token carries `meta:read` alone - every addon has it without any declaration. A credential
-without `rpc:read` puts the client in `mode: 'names-only'`: the metadata (names, rooms, functions) is loaded and
+that does not cover `rpc:read` puts the client in `mode: 'names-only'`: the metadata (names, rooms, functions) is loaded and
 followed, `ready()` resolves, and every RPC method (`setValue`, `call`, `history`, …) rejects `forbidden` naming
 `rpc:read` without a request; `box.devices` and `box.values` stay empty. Show *"names only: pair for devices and
 values"* and offer pairing.
@@ -295,7 +304,10 @@ address are the stream's `old`/`new`.
 lite-rpc's JSON path and stream, the state store, the metadata, pairing). The package's own tests run against it; so
 can yours: `box.event()`, `box.push()`, `box.updateDevice()`, `box.replaceDevice()` put messages on the stream,
 `box.dropStreams()` and `box.dropMetaStreams()` end the event and the metadata change streams for a reconnect test
-(`streamsOpened`, `metaStreamsOpened` count the reopen), `box.calls` records the lite-rpc calls. The errors the client
+(`streamsOpened`, `metaStreamsOpened` count the reopen), `box.calls` records the lite-rpc calls. `scopes` is checked
+and answered as the system does it: the auth state lists the highest tier only, and a pairing request is approved
+with the scopes of its `access` (`devices: 'operate'` → `rpc:operate`; `box.tokens` holds the tokens issued, each a
+credential beside `token`); an unknown area or level is a `422`. The errors the client
 throws are `OccuLiteError`s; `httpError(status, body)` and `abortError(signal)` build the same ones, for an adapter's
 mapping and its tests.
 
